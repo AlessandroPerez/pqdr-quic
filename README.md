@@ -1,3 +1,77 @@
+# 🔐 PQDR-QUIC - Post-Quantum Double-Ratchet QUIC
+
+**A research fork of Cloudflare's quiche with post-quantum cryptography and Signal-style double ratchet**
+
+[![Performance](https://img.shields.io/badge/overhead-5.4%25-green)](PQDR-QUIC.md)
+[![Security](https://img.shields.io/badge/PQ-ML--KEM--768-blue)](PQDR-QUIC.md)
+[![Ratchet](https://img.shields.io/badge/ratchet-60s-orange)](PQDR-QUIC.md)
+
+> ⚠️ **Research Implementation**: This is an experimental implementation for research purposes. Not yet standardized by IETF.
+
+## What is PQDR-QUIC?
+
+PQDR-QUIC extends QUIC with:
+- **Post-Quantum Security**: ML-KEM-768 (NIST Level 3) every 60 seconds
+- **Forward Secrecy**: Per-packet BLAKE3 key derivation (~64ns overhead)
+- **Post-Compromise Recovery**: System healing within 60 seconds of compromise
+- **Minimal Overhead**: Only 5.4% performance impact (2327 → 2201 Mbps)
+
+📖 **[Complete PQDR Documentation](PQDR-QUIC.md)** - Architecture, security properties, benchmarks, and testing guide
+
+## Quick Start
+
+```bash
+# Clone and build
+git clone https://github.com/AlessandroPerez/pqdr-quic.git
+cd pqdr-quic
+cargo build --release --bin quiche-server --bin quiche-client
+
+# Test PQDR vs Vanilla QUIC (requires 20GB test file)
+dd if=/dev/urandom of=test-www/test_20gb.bin bs=1M count=20480
+./performance_test.sh --runs 5
+```
+
+## Key Differences from Standard quiche
+
+| Feature | Standard quiche | PQDR-QUIC |
+|---------|----------------|-----------|
+| Post-Quantum | ❌ TLS 1.3 only | ✅ ML-KEM-768 |
+| Per-Packet Keys | ❌ TLS session key | ✅ BLAKE3 ratchet |
+| Compromise Recovery | ❌ None | ✅ 60s ML-KEM ratchet |
+| Performance | 2327 Mbps | 2201 Mbps (-5.4%) |
+| Cipher | AES-GCM (default) | ChaCha20-Poly1305 |
+
+### Performance Results
+
+**20GB file transfer (5 runs each):**
+- Vanilla QUIC: 2327.41 Mbps (CV: 1.00%)
+- PQDR-QUIC: 2200.71 Mbps (CV: 1.00%)
+- **Overhead: 5.44%** ≈ 4.4 seconds for 20GB
+
+**Per-packet cost:** ~250ns (64ns BLAKE3 + 186ns AEAD context init/cleanup)
+**Per-ratchet cost:** ~50μs ML-KEM-768 encapsulation
+
+### Security Properties
+
+**Forward Secrecy (Every Packet):**
+- ✅ Compromise of key K_n cannot decrypt packets 1 through n-1
+- ⚡ Via BLAKE3 one-way key derivation chain
+
+**Post-Compromise Recovery (Every 60s):**
+- ✅ Full system compromise at time T only allows ≤60s of decryption
+- ⚡ Via ML-KEM-768 key exchange introducing fresh entropy
+
+**Double Ratchet Benefits:**
+```
+Compromise → Forward Secrecy → Past Safe ✓
+          ↓
+   Post-Compromise Recovery → Future Safe ✓
+```
+
+---
+
+# Original quiche README
+
 ![quiche](quiche.svg)
 
 [![crates.io](https://img.shields.io/crates/v/quiche.svg)](https://crates.io/crates/quiche)
