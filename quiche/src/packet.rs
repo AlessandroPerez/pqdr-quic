@@ -655,6 +655,13 @@ pub fn decrypt_pkt<'a>(
     b: &'a mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     aead: &crypto::Open,
 ) -> Result<octets::Octets<'a>> {
+    decrypt_pkt_with_counter(b, pn, pn, pn_len, payload_len, aead)
+}
+
+pub fn decrypt_pkt_with_counter<'a>(
+    b: &'a mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
+    aead: &crypto::Open,
+) -> Result<octets::Octets<'a>> {
     let payload_offset = b.off();
 
     let (header, mut payload) = b.split_at(payload_offset)?;
@@ -666,7 +673,34 @@ pub fn decrypt_pkt<'a>(
     let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
 
     let payload_len =
-        aead.open_with_u64_counter(pn, header.as_ref(), ciphertext.as_mut())?;
+        aead.open_with_u64_counter(aead_counter, header.as_ref(), ciphertext.as_mut())?;
+
+    Ok(b.get_bytes(payload_len)?)
+}
+
+/// Fast PQDR decryption bypassing PacketKey object creation.
+/// Uses direct ChaCha20-Poly1305 primitives for maximum performance.
+pub fn decrypt_pkt_pqdr_fast<'a>(
+    b: &'a mut octets::OctetsMut, pn: u64, ratchet_key: &[u8; 32],
+    pn_len: usize, payload_len: usize,
+) -> Result<octets::Octets<'a>> {
+    let payload_offset = b.off();
+
+    let (header, mut payload) = b.split_at(payload_offset)?;
+
+    let payload_len = payload_len
+        .checked_sub(pn_len)
+        .ok_or(Error::InvalidPacket)?;
+
+    let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
+
+    // Decrypt directly with ratchet key (counter=0 since key is single-use)
+    let payload_len = crypto::pqdr_open(
+        ratchet_key,
+        0,  // Counter always 0 - each ratchet key used once
+        header.as_ref(),
+        ciphertext.as_mut(),
+    )?;
 
     Ok(b.get_bytes(payload_len)?)
 }
@@ -701,10 +735,17 @@ pub fn encrypt_pkt(
     b: &mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
 ) -> Result<usize> {
+    encrypt_pkt_with_counter(b, pn, pn, pn_len, payload_len, payload_offset, extra_in, aead)
+}
+
+pub fn encrypt_pkt_with_counter(
+    b: &mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
+    payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
+) -> Result<usize> {
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
     let ciphertext_len = aead.seal_with_u64_counter(
-        pn,
+        aead_counter,  // Use the override counter for AEAD
         header.as_ref(),
         payload.as_mut(),
         payload_len,
@@ -712,6 +753,57 @@ pub fn encrypt_pkt(
     )?;
 
     encrypt_hdr(&mut header, pn_len, payload.as_ref(), aead)?;
+
+    Ok(payload_offset + ciphertext_len)
+}
+
+/// Encrypt packet with separate keys for payload and header protection
+///
+/// This is used for PQDR-QUIC where payload uses per-packet ratchet keys
+/// but header protection must use a stable TLS-derived key
+pub fn encrypt_pkt_with_separate_hp(
+    b: &mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
+    payload_offset: usize, extra_in: Option<&[u8]>,
+    payload_aead: &crypto::Seal,
+    hp_aead: &crypto::Seal,
+) -> Result<usize> {
+    let (mut header, mut payload) = b.split_at(payload_offset)?;
+
+    // Encrypt payload with the ratchet-derived key
+    let ciphertext_len = payload_aead.seal_with_u64_counter(
+        aead_counter,
+        header.as_ref(),
+        payload.as_mut(),
+        payload_len,
+        extra_in,
+    )?;
+
+    // Protect header with the stable TLS-derived key
+    encrypt_hdr(&mut header, pn_len, payload.as_ref(), hp_aead)?;
+
+    Ok(payload_offset + ciphertext_len)
+}
+
+/// Fast PQDR encryption bypassing PacketKey object creation.
+/// Uses direct ChaCha20-Poly1305 primitives for maximum performance.
+pub fn encrypt_pkt_pqdr_fast(
+    b: &mut octets::OctetsMut, pn: u64, ratchet_key: &[u8; 32], pn_len: usize,
+    payload_len: usize, payload_offset: usize,
+    hp_aead: &crypto::Seal,
+) -> Result<usize> {
+    let (mut header, mut payload) = b.split_at(payload_offset)?;
+
+    // Encrypt payload directly with ratchet key (counter=0 since key is single-use)
+    let ciphertext_len = crypto::pqdr_seal(
+        ratchet_key,
+        0,  // Counter always 0 - each ratchet key used once
+        header.as_ref(),
+        payload.as_mut(),
+        payload_len,
+    )?;
+
+    // Protect header with the stable TLS-derived key
+    encrypt_hdr(&mut header, pn_len, payload.as_ref(), hp_aead)?;
 
     Ok(payload_offset + ciphertext_len)
 }

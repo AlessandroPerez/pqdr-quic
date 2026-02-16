@@ -216,6 +216,8 @@ fn target_dir_path() -> std::path::PathBuf {
 }
 
 fn main() {
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+
     if cfg!(feature = "boringssl-vendored") &&
         !cfg!(feature = "boringssl-boring-crate") &&
         !cfg!(feature = "openssl")
@@ -250,6 +252,13 @@ fn main() {
             .unwrap_or("static".to_string());
         println!("cargo:rustc-link-lib={bssl_link_kind}=ssl");
         println!("cargo:rustc-link-lib={bssl_link_kind}=crypto");
+
+        // Link C++ standard library for newer BoringSSL with C++ code
+        if target_os != "windows" && target_os != "macos" {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+        } else if target_os == "macos" {
+            println!("cargo:rustc-link-lib=dylib=c++");
+        }
     }
 
     if cfg!(feature = "boringssl-boring-crate") {
@@ -258,7 +267,6 @@ fn main() {
     }
 
     // MacOS: Allow cdylib to link with undefined symbols
-    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     if target_os == "macos" {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }

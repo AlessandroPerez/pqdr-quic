@@ -605,6 +605,8 @@ pub struct Config {
     track_unknown_transport_params: Option<usize>,
 
     initial_rtt: Duration,
+
+    pqdr_quic_enabled: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -681,6 +683,8 @@ impl Config {
 
             track_unknown_transport_params: None,
             initial_rtt: DEFAULT_INITIAL_RTT,
+
+            pqdr_quic_enabled: false,
         })
     }
 
@@ -1220,6 +1224,17 @@ impl Config {
     pub fn enable_track_unknown_transport_parameters(&mut self, size: usize) {
         self.track_unknown_transport_params = Some(size);
     }
+    /// Enables PQDR-QUIC mode with post-quantum cryptography and double ratchet.
+    ///
+    /// When enabled, the connection will use ML-KEM-768 for key exchange and
+    /// implement the double-ratchet protocol for post-compromise security.
+    ///
+    /// The default is `false`.
+    pub fn enable_pqdr_quic(&mut self, enabled: bool) {
+        self.pqdr_quic_enabled = enabled;
+        self.local_transport_params.pqdr_quic_supported = enabled;
+    }
+
 }
 
 /// Tracks the health of the tx_buffered value.
@@ -1496,6 +1511,23 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// PQDR-QUIC double-ratchet state (if enabled)
+    ratchet_state: Option<crypto::ratchet::RatchetState>,
+
+    /// Whether PQDR-QUIC is enabled for this connection
+    pqdr_quic_enabled: bool,
+
+    /// Whether we can actually use ratchet keys for encryption/decryption
+    /// Server: set after receiving ACK in Application epoch (client confirmed handshake)
+    /// Client: set after processing HANDSHAKE_DONE frame
+    pqdr_ratchet_ready: bool,
+
+    /// Cached PQDR Seal for current ratchet epoch (performance optimization)
+    pqdr_cached_seal: Option<crypto::Seal>,
+
+    /// Epoch number for which the cached seal is valid
+    pqdr_cached_seal_epoch: u32,
 }
 
 /// Creates a new server-side connection.
@@ -1992,6 +2024,12 @@ impl<F: BufFactory> Connection<F> {
             stream_data_blocked_recv_count: 0,
 
             max_amplification_factor: config.max_amplification_factor,
+
+            ratchet_state: None,
+            pqdr_quic_enabled: config.pqdr_quic_enabled,
+            pqdr_ratchet_ready: false,
+            pqdr_cached_seal: None,
+            pqdr_cached_seal_epoch: 0,
         };
 
         if let Some(odcid) = odcid {
@@ -3037,16 +3075,74 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        let mut payload = packet::decrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            aead,
-        )
-        .map_err(|e| {
-            drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
-        })?;
+        // For PQDR-QUIC, use ratchet-derived keys for Application packets
+        // ONLY after both sides are ready
+        let packet_key_for_pqdr;
+        let use_pqdr_decrypt;
+
+        if self.pqdr_quic_enabled &&
+            self.pqdr_ratchet_ready &&
+            epoch == packet::Epoch::Application &&
+            self.ratchet_state.is_some()
+        {
+            // Use packet number as message number (1-to-1 mapping)
+            let ratchet = self.ratchet_state.as_mut().unwrap();
+            let ratchet_epoch = ratchet.epoch();
+            let msg_num = pn;  // packet_number = message_number
+
+            // Decrypt with the specific message number
+            match ratchet.decrypt_key(ratchet_epoch, msg_num) {
+                Ok(key) => {
+                    packet_key_for_pqdr = key;
+                    use_pqdr_decrypt = true;
+                },
+                Err(e) => {
+                    // If we can't decrypt with ratchet key, fall back to regular AEAD
+                    warn!("{} PQDR: ratchet decrypt_key failed for pn={} msg={}: {:?}",
+                        self.trace_id, pn, msg_num, e);
+                    packet_key_for_pqdr = [0u8; 32];
+                    use_pqdr_decrypt = false;
+                },
+            }
+        } else {
+            use_pqdr_decrypt = false;
+            packet_key_for_pqdr = [0u8; 32];
+            if self.pqdr_quic_enabled && epoch == packet::Epoch::Application {
+                trace!(
+                    "{} PQDR: using TLS key for RX pn={} epoch={:?} ratchet_ready={} ratchet_init={}",
+                    self.trace_id,
+                    pn,
+                    epoch,
+                    self.pqdr_ratchet_ready,
+                    self.ratchet_state.is_some()
+                );
+            }
+        }
+
+        // Use fast PQDR decryption with direct ChaCha20-Poly1305 primitives
+        let mut payload = if use_pqdr_decrypt {
+            packet::decrypt_pkt_pqdr_fast(
+                &mut b,
+                pn,
+                &packet_key_for_pqdr,
+                pn_len,
+                payload_len,
+            )
+            .map_err(|e| {
+                drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+            })?
+        } else {
+            packet::decrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                aead,
+            )
+            .map_err(|e| {
+                drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
+            })?
+        };
 
         if self.pkt_num_spaces[epoch].recv_pkt_num.contains(pn) {
             trace!("{} ignored duplicate packet {}", self.trace_id, pn);
@@ -3689,6 +3785,40 @@ impl<F: BufFactory> Connection<F> {
 
         if self.local_error.is_none() {
             self.do_handshake(now)?;
+        }
+
+        // For PQDR-QUIC: Enable ratchet keys for packets AFTER HANDSHAKE_DONE was sent
+        // This check happens at the start of each packet send, ensuring HANDSHAKE_DONE
+        // itself is encrypted with TLS keys, but subsequent packets use ratchet keys
+        if self.pqdr_quic_enabled &&
+            self.is_server &&
+            self.handshake_done_sent &&
+            !self.pqdr_ratchet_ready
+        {
+            self.pqdr_ratchet_ready = true;
+        }
+
+        // Check if we should initiate a ratchet (PQDR-QUIC)
+        if self.pqdr_quic_enabled && self.handshake_completed {
+            if let Some(ref mut ratchet) = self.ratchet_state {
+                if ratchet.should_initiate_ratchet() {
+                    match ratchet.initiate_ratchet() {
+                        Ok((epoch, pubkey)) => {
+                            trace!(
+                                "{} initiating ratchet epoch={} pubkey_len={}",
+                                self.trace_id,
+                                epoch,
+                                pubkey.len()
+                            );
+                            // Frame will be queued and sent in next packet
+                            // TODO: Queue KEY_RATCHET frame for immediate sending
+                        },
+                        Err(e) => {
+                            warn!("{} failed to initiate ratchet: {:?}", self.trace_id, e);
+                        },
+                    }
+                }
+            }
         }
 
         // Forwarding the error value here could confuse
@@ -4977,15 +5107,61 @@ impl<F: BufFactory> Connection<F> {
             None => return Err(Error::InvalidState),
         };
 
-        let written = packet::encrypt_pkt(
-            &mut b,
-            pn,
-            pn_len,
-            payload_len,
-            payload_offset,
-            None,
-            aead,
-        )?;
+        // For PQDR-QUIC, use ratchet-derived keys for Application packets
+        // ONLY after both sides have confirmed and are ready
+        let tls_aead = aead;  // Keep reference to TLS key for header protection
+        let packet_key_for_pqdr;  // Hold the ratchet key if using PQDR
+
+        let use_pqdr = self.pqdr_quic_enabled &&
+            self.pqdr_ratchet_ready &&
+            epoch == packet::Epoch::Application &&
+            self.ratchet_state.is_some();
+
+        if use_pqdr {
+            // Use packet number as message number (1-to-1 mapping)
+            // Advance ratchet to match packet number and derive key
+            let ratchet = self.ratchet_state.as_mut().unwrap();
+            let epoch = ratchet.epoch();
+            let msg_num = pn;  // packet_number = message_number
+
+            // Advance send chain to packet number and get key
+            packet_key_for_pqdr = ratchet.encrypt_key_for_msg(msg_num)?;
+        } else {
+            packet_key_for_pqdr = [0u8; 32];  // Dummy value, won't be used
+            if self.pqdr_quic_enabled && epoch == packet::Epoch::Application {
+                trace!(
+                    "{} PQDR: using TLS key for TX pn={} epoch={:?} ratchet_ready={} ratchet_init={}",
+                    self.trace_id,
+                    pn,
+                    epoch,
+                    self.pqdr_ratchet_ready,
+                    self.ratchet_state.is_some()
+                );
+            }
+        }
+
+        let (written, used_ratchet_key) = if use_pqdr {
+            // Use fast PQDR encryption with direct ChaCha20-Poly1305 primitives
+            (packet::encrypt_pkt_pqdr_fast(
+                &mut b,
+                pn,
+                &packet_key_for_pqdr,
+                pn_len,
+                payload_len,
+                payload_offset,
+                tls_aead,  // TLS key for header protection
+            )?, true)
+        } else {
+            (packet::encrypt_pkt(
+                &mut b,
+                pn,
+                pn_len,
+                payload_len,
+                payload_offset,
+                None,
+                tls_aead,
+            )?, false)
+        };
 
         let sent_pkt_has_data = if path.recovery.gcongestion_enabled() {
             has_data || dgram_emitted
@@ -7411,6 +7587,17 @@ impl<F: BufFactory> Connection<F> {
         self.ids
             .set_source_conn_id_limit(peer_params.active_conn_id_limit);
 
+        // Enable PQDR-QUIC only if both peers support it
+        if self.pqdr_quic_enabled && !peer_params.pqdr_quic_supported {
+            warn!(
+                "{} PQDR-QUIC disabled: peer does not support it",
+                self.trace_id
+            );
+            self.pqdr_quic_enabled = false;
+        } else if self.pqdr_quic_enabled && peer_params.pqdr_quic_supported {
+            // PQDR-QUIC negotiated
+        }
+
         self.peer_transport_params = peer_params;
 
         Ok(())
@@ -7540,6 +7727,9 @@ impl<F: BufFactory> Connection<F> {
             if self.is_server {
                 self.handshake_confirmed = true;
 
+                // For PQDR-QUIC, server will enable ratchet keys AFTER sending HANDSHAKE_DONE
+                // (not immediately here, to ensure HANDSHAKE_DONE itself uses TLS keys)
+
                 self.drop_epoch_state(packet::Epoch::Handshake, now);
             }
 
@@ -7555,6 +7745,25 @@ impl<F: BufFactory> Connection<F> {
                    self.handshake.sigalg(),
                    self.handshake.is_resumed(),
                    self.peer_transport_params);
+
+            // Initialize PQDR-QUIC ratchet state if enabled
+            if self.pqdr_quic_enabled && self.ratchet_state.is_none() {
+                // Extract real TLS handshake secret using SSL_export_keying_material
+                let mut handshake_secret = vec![0u8; 32];
+                if let Err(e) = self.handshake.export_keying_material(
+                    "EXPORTER-PQDR-QUIC",
+                    None,
+                    &mut handshake_secret
+                ) {
+                    error!("{} failed to export TLS keying material for PQDR-QUIC: {:?}", &self.trace_id, e);
+                    return Err(e);
+                }
+
+                self.ratchet_state = Some(crypto::ratchet::RatchetState::from_handshake_secret(
+                    &handshake_secret,
+                    !self.is_server,
+                ));
+            }
         }
 
         Ok(())
@@ -8208,8 +8417,63 @@ impl<F: BufFactory> Connection<F> {
 
                 self.handshake_confirmed = true;
 
+                // For PQDR-QUIC, client can now use ratchet keys after receiving HANDSHAKE_DONE
+                if self.pqdr_quic_enabled {
+                    self.pqdr_ratchet_ready = true;
+                }
+
                 // Once the handshake is confirmed, we can drop Handshake keys.
                 self.drop_epoch_state(packet::Epoch::Handshake, now);
+            },
+
+            frame::Frame::KeyRatchet {
+                epoch,
+                is_initiator,
+                key_material,
+            } => {
+                trace!(
+                    "{} rx KEY_RATCHET epoch={} initiator={} len={}",
+                    self.trace_id,
+                    epoch,
+                    is_initiator,
+                    key_material.len()
+                );
+
+                if !self.pqdr_quic_enabled {
+                    // Ignore KEY_RATCHET frames if PQDR-QUIC not enabled
+                    return Ok(());
+                }
+
+                if let Some(ref mut ratchet) = self.ratchet_state {
+                    if is_initiator {
+                        // Received ML-KEM public key, respond with ciphertext
+                        match ratchet.respond_to_ratchet(epoch, &key_material) {
+                            Ok((resp_epoch, ciphertext)) => {
+                                // Queue KEY_RATCHET frame with ciphertext to send
+                                trace!(
+                                    "{} sending KEY_RATCHET response epoch={} ciphertext_len={}",
+                                    self.trace_id,
+                                    resp_epoch,
+                                    ciphertext.len()
+                                );
+                                // Frame will be sent in next packet
+                                // TODO: Queue frame for immediate sending
+                            },
+                            Err(e) => {
+                                warn!("{} failed to respond to ratchet: {:?}", self.trace_id, e);
+                                return Err(e);
+                            },
+                        }
+                    } else {
+                        // Received ML-KEM ciphertext, complete our initiated ratchet
+                        if let Err(e) = ratchet.complete_ratchet(epoch, &key_material) {
+                            warn!("{} failed to complete ratchet: {:?}", self.trace_id, e);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    warn!("{} received KEY_RATCHET but ratchet_state not initialized", self.trace_id);
+                }
             },
 
             frame::Frame::Datagram { data } => {

@@ -184,6 +184,17 @@ pub enum Frame {
     DatagramHeader {
         length: usize,
     },
+
+    /// KEY_RATCHET frame for PQDR-QUIC double ratchet
+    /// Carries ML-KEM-768 public key (initiator) or ciphertext (responder)
+    KeyRatchet {
+        /// Ratchet epoch number
+        epoch: u32,
+        /// true = public key (initiator), false = ciphertext (responder)
+        is_initiator: bool,
+        /// ML-KEM-768 public key (1184 bytes) or ciphertext (1088 bytes)
+        key_material: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -330,6 +341,28 @@ impl Frame {
             0x1e => Frame::HandshakeDone,
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
+
+            0x40 => {
+                // KEY_RATCHET frame for PQDR-QUIC
+                let epoch = b.get_varint()? as u32;
+                let flags = b.get_u8()?;
+                let is_initiator = (flags & 0x01) != 0;
+
+                // Determine expected length based on whether it's pubkey or ciphertext
+                let expected_len = if is_initiator {
+                    1184 // ML-KEM-768 public key
+                } else {
+                    1088 // ML-KEM-768 ciphertext
+                };
+
+                let key_material = b.get_bytes(expected_len)?.to_vec();
+
+                Frame::KeyRatchet {
+                    epoch,
+                    is_initiator,
+                    key_material,
+                }
+            },
 
             _ => return Err(Error::InvalidFrame),
         };
@@ -586,6 +619,21 @@ impl Frame {
                 b.put_varint(0x1e)?;
             },
 
+            Frame::KeyRatchet {
+                epoch,
+                is_initiator,
+                key_material,
+            } => {
+                b.put_varint(0x40)?;
+                b.put_varint(*epoch as u64)?;
+
+                // Flags byte: bit 0 = is_initiator
+                let flags = if *is_initiator { 0x01 } else { 0x00 };
+                b.put_u8(flags)?;
+
+                b.put_bytes(key_material.as_ref())?;
+            },
+
             Frame::Datagram { data } => {
                 encode_dgram_header(data.len() as u64, b)?;
 
@@ -795,6 +843,17 @@ impl Frame {
 
             Frame::HandshakeDone => {
                 1 // frame type
+            },
+
+            Frame::KeyRatchet {
+                epoch,
+                key_material,
+                ..
+            } => {
+                1 + // frame type (0x40)
+                octets::varint_len(*epoch as u64) + // epoch
+                1 + // flags byte
+                key_material.len() // key material (1184 or 1088 bytes)
             },
 
             Frame::Datagram { data } => {
@@ -1033,6 +1092,16 @@ impl Frame {
                 length: *length as u64,
                 raw: None,
             },
+
+            Frame::KeyRatchet { .. } => {
+                // PQDR-QUIC KEY_RATCHET frame (not part of standard qlog)
+                // Map to Unknown frame type
+                QuicFrame::Unknown {
+                    frame_type_value: Some(0x40),
+                    raw_frame_type: 0x40,
+                    raw: None,
+                }
+            },
         }
     }
 }
@@ -1191,6 +1260,21 @@ impl std::fmt::Debug for Frame {
 
             Frame::HandshakeDone => {
                 write!(f, "HANDSHAKE_DONE")?;
+            },
+
+            Frame::KeyRatchet {
+                epoch,
+                is_initiator,
+                key_material,
+            } => {
+                let key_type = if *is_initiator { "PUBKEY" } else { "CIPHERTEXT" };
+                write!(
+                    f,
+                    "KEY_RATCHET epoch={} type={} len={}",
+                    epoch,
+                    key_type,
+                    key_material.len()
+                )?;
             },
 
             Frame::Datagram { data } => {

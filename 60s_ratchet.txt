@@ -1,0 +1,117 @@
+Performance Test Results - Mon 16 Feb 2026 09:30:16 PM CET
+Number of runs per configuration: 5
+========================================
+
+=== Vanilla QUIC - Run 1 ===
+Download time:      70.789255409s
+Hash time:          31.625756215s
+Total time:         102.415011624s
+Throughput:         2314.47 Mbps
+Integrity check:    PASS
+
+=== Vanilla QUIC - Run 2 ===
+Download time:      70.175208060s
+Hash time:          29.926902413s
+Total time:         100.102110473s
+Throughput:         2334.72 Mbps
+Integrity check:    PASS
+
+=== Vanilla QUIC - Run 3 ===
+Download time:      70.151994624s
+Hash time:          30.914923926s
+Total time:         101.066918550s
+Throughput:         2335.50 Mbps
+Integrity check:    PASS
+
+=== Vanilla QUIC - Run 4 ===
+Download time:      69.230186717s
+Hash time:          35.881699086s
+Total time:         105.111885803s
+Throughput:         2366.59 Mbps
+Integrity check:    PASS
+
+=== Vanilla QUIC - Run 5 ===
+Download time:      71.677324836s
+Hash time:          31.209235729s
+Total time:         102.886560565s
+Throughput:         2285.79 Mbps
+Integrity check:    PASS
+
+=== PQDR-QUIC - Run 1 ===
+Download time:      72.436065473s
+Hash time:          30.370458151s
+Total time:         102.806523624s
+Throughput:         2261.85 Mbps
+Integrity check:    PASS
+
+=== PQDR-QUIC - Run 2 ===
+Download time:      73.814771727s
+Hash time:          30.539333840s
+Total time:         104.354105567s
+Throughput:         2219.60 Mbps
+Integrity check:    PASS
+
+=== PQDR-QUIC - Run 3 ===
+Download time:      76.471327623s
+Hash time:          30.680691991s
+Total time:         107.152019614s
+Throughput:         2142.50 Mbps
+Integrity check:    PASS
+
+=== PQDR-QUIC - Run 4 ===
+Download time:      74.616091982s
+Hash time:          28.692605144s
+Total time:         103.308697126s
+Throughput:         2195.77 Mbps
+Integrity check:    PASS
+
+=== PQDR-QUIC - Run 5 ===
+Download time:      75.022515235s
+Hash time:          30.334569155s
+Total time:         105.357084390s
+Throughput:         2183.87 Mbps
+Integrity check:    PASS
+
+==================================
+Vanilla QUIC - Aggregate Statistics
+==================================
+Throughput:
+  Mean:     2327.41 Mbps
+  Median:   2334.72 Mbps
+  StdDev:   26.6593323247 Mbps
+  Min:      2285.79 Mbps
+  Max:      2366.59 Mbps
+  CV:       1.00%
+
+Download Time:
+  Mean:     70.40s
+  Median:   70.175208060s
+  StdDev:   .8079083745s
+  Min:      69.230186717s
+  Max:      71.677324836s
+
+==================================
+PQDR-QUIC - Aggregate Statistics
+==================================
+Throughput:
+  Mean:     2200.71 Mbps
+  Median:   2195.77 Mbps
+  StdDev:   39.4748020894 Mbps
+  Min:      2142.50 Mbps
+  Max:      2261.85 Mbps
+  CV:       1.00%
+
+Download Time:
+  Mean:     74.47s
+  Median:   74.616091982s
+  StdDev:   1.3340271327s
+  Min:      72.436065473s
+  Max:      76.471327623s
+
+
+==================================
+Performance Comparison
+==================================
+PQDR vs Vanilla:
+  Throughput difference: 5.00%
+  Download time overhead: -5.00%

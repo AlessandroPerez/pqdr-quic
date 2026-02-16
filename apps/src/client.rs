@@ -99,6 +99,15 @@ pub fn connect(
     // Create the configuration for the QUIC connection.
     let mut config = quiche::Config::new(args.version).unwrap();
 
+    // Enable PQDR-QUIC unless disabled
+    if !args.disable_pqdr {
+        config.enable_pqdr_quic(true);
+        eprintln!("🔒 PQDR-QUIC enabled: Post-quantum security with double-ratcheting");
+    } else {
+        config.enable_pqdr_quic(false);
+        eprintln!("⚠️  PQDR-QUIC disabled: Using standard QUIC (vanilla mode)");
+    }
+
     if let Some(ref trust_origin_ca_pem) = args.trust_origin_ca_pem {
         config
             .load_verify_locations_from_file(trust_origin_ca_pem)

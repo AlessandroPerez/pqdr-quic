@@ -12,12 +12,15 @@ use libc::c_void;
 // statically allocate it. While it is not often modified upstream, it needs to
 // be kept in sync.
 #[repr(C)]
-struct EVP_AEAD_CTX {
+pub struct EVP_AEAD_CTX_ST {
     aead: libc::uintptr_t,
     opaque: [u8; 580],
     alignment: u64,
     tag_len: u8,
 }
+
+// Internal alias for backwards compat
+type EVP_AEAD_CTX = EVP_AEAD_CTX_ST;
 
 #[derive(Clone)]
 #[repr(C)]
@@ -25,6 +28,23 @@ pub(crate) struct AES_KEY {
     rd_key: [u32; 4 * (14 + 1)],
     rounds: c_int,
 }
+
+// ML-KEM-768 opaque types (must match BoringSSL structs)
+#[repr(C)]
+pub struct MLKEM768_public_key {
+    opaque: [u8; 512 * (3 + 9) + 32 + 32],
+}
+
+#[repr(C)]
+pub struct MLKEM768_private_key {
+    opaque: [u8; 512 * (3 + 3 + 9) + 32 + 32 + 32],
+}
+
+// ML-KEM-768 constants
+pub const MLKEM768_PUBLIC_KEY_BYTES: usize = 1184;
+pub const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
+pub const MLKEM_SHARED_SECRET_BYTES: usize = 32;
+pub const MLKEM_SEED_BYTES: usize = 64;
 
 impl Algorithm {
     fn get_evp_aead(self) -> *const EVP_AEAD {
@@ -75,6 +95,27 @@ impl PacketKey {
         // packet number) to be zero, which would not be the case for packet
         // number spaces after Initial as the same packet number sequence is
         // shared.
+        let _ = pkt_key.seal_with_u64_counter(0, b"", &mut [0_u8; 16], 0, None);
+
+        Ok(pkt_key)
+    }
+
+    /// Create PacketKey directly from PQDR ratchet-derived key (BLAKE3 output)
+    /// This bypasses HKDF-Expand for better performance with per-packet rekeying.
+    /// The 32-byte BLAKE3 output is used directly as the ChaCha20 key.
+    pub fn from_pqdr_ratchet_key(ratchet_key: &[u8; 32]) -> Result<Self> {
+        assert_eq!(ratchet_key.len(), 32); // ChaCha20 key size
+
+        // Use the BLAKE3 output directly as the ChaCha20 key
+        let key = ratchet_key.to_vec();
+
+        // Use a fixed base nonce - the actual nonce will be XORed with packet number
+        let iv = vec![0u8; 12]; // ChaCha20 nonce size
+
+        let pkt_key = Self::new(Algorithm::ChaCha20_Poly1305, key, iv, 0)?;
+
+        // Dummy seal operation to prime the AEAD context
+        // This is needed because BoringCrypto requires proper initialization
         let _ = pkt_key.seal_with_u64_counter(0, b"", &mut [0_u8; 16], 0, None);
 
         Ok(pkt_key)
@@ -322,9 +363,9 @@ pub(crate) fn hkdf_expand(
 extern "C" {
     fn EVP_aead_aes_128_gcm_tls13() -> *const EVP_AEAD;
 
-    fn EVP_aead_aes_256_gcm_tls13() -> *const EVP_AEAD;
+    pub fn EVP_aead_aes_256_gcm_tls13() -> *const EVP_AEAD;
 
-    fn EVP_aead_chacha20_poly1305() -> *const EVP_AEAD;
+    pub fn EVP_aead_chacha20_poly1305() -> *const EVP_AEAD;
 
     // HKDF
     fn HKDF_extract(
@@ -337,24 +378,32 @@ extern "C" {
         prk_len: usize, info: *const u8, info_len: usize,
     ) -> c_int;
 
-    // EVP_AEAD_CTX
-    fn EVP_AEAD_CTX_init(
+   // EVP_AEAD_CTX
+    pub fn EVP_AEAD_CTX_init(
         ctx: *mut EVP_AEAD_CTX, aead: *const EVP_AEAD, key: *const u8,
         key_len: usize, tag_len: usize, engine: *mut c_void,
     ) -> c_int;
 
-    fn EVP_AEAD_CTX_open(
+    pub fn EVP_AEAD_CTX_open(
         ctx: *const EVP_AEAD_CTX, out: *mut u8, out_len: *mut usize,
         max_out_len: usize, nonce: *const u8, nonce_len: usize, inp: *const u8,
         in_len: usize, ad: *const u8, ad_len: usize,
     ) -> c_int;
 
-    fn EVP_AEAD_CTX_seal_scatter(
+    pub fn EVP_AEAD_CTX_seal_scatter(
         ctx: *const EVP_AEAD_CTX, out: *mut u8, out_tag: *mut u8,
         out_tag_len: *mut usize, max_out_tag_len: usize, nonce: *const u8,
         nonce_len: usize, inp: *const u8, in_len: usize, extra_in: *const u8,
         extra_in_len: usize, ad: *const u8, ad_len: usize,
     ) -> c_int;
+
+    pub fn EVP_AEAD_CTX_seal(
+        ctx: *const EVP_AEAD_CTX, out: *mut u8, out_len: *mut usize,
+        max_out_len: usize, nonce: *const u8, nonce_len: usize,
+        inp: *const u8, in_len: usize, ad: *const u8, ad_len: usize,
+    ) -> c_int;
+
+    pub fn EVP_AEAD_CTX_cleanup(ctx: *mut EVP_AEAD_CTX);
 
     // AES
     fn AES_set_encrypt_key(
@@ -366,8 +415,144 @@ extern "C" {
     ) -> c_void;
 
     // ChaCha20
-    fn CRYPTO_chacha_20(
+    pub fn CRYPTO_chacha_20(
         out: *mut u8, inp: *const u8, in_len: usize, key: *const u8,
         nonce: *const u8, counter: u32,
     ) -> c_void;
+
+    // Poly1305 (state is 512 bytes)
+    pub fn CRYPTO_poly1305_init(state: *mut [u8; 512], key: *const u8) -> c_void;
+
+    pub fn CRYPTO_poly1305_update(
+        state: *mut [u8; 512], in_: *const u8, in_len: usize,
+    ) -> c_void;
+
+    pub fn CRYPTO_poly1305_finish(state: *mut [u8; 512], mac: *mut u8) -> c_void;
+
+    // ML-KEM-768
+    fn MLKEM768_generate_key(
+        out_encoded_public_key: *mut u8,
+        optional_out_seed: *mut u8,
+        out_private_key: *mut MLKEM768_private_key,
+    );
+
+    fn MLKEM768_encap(
+        out_ciphertext: *mut u8,
+        out_shared_secret: *mut u8,
+        public_key: *const MLKEM768_public_key,
+    );
+
+    fn MLKEM768_decap(
+        out_shared_secret: *mut u8,
+        ciphertext: *const u8,
+        ciphertext_len: usize,
+        private_key: *const MLKEM768_private_key,
+    ) -> c_int;
+
+    fn MLKEM768_public_from_private(
+        out_public_key: *mut MLKEM768_public_key,
+        private_key: *const MLKEM768_private_key,
+    );
+}
+
+// ML-KEM-768 Rust API wrappers
+impl MLKEM768_public_key {
+    /// Parse a public key from its encoded form
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MLKEM768_PUBLIC_KEY_BYTES {
+            return Err(Error::CryptoFail);
+        }
+        let mut key = MLKEM768_public_key {
+            opaque: [0; 512 * (3 + 9) + 32 + 32],
+        };
+        key.opaque.copy_from_slice(bytes);
+        Ok(key)
+    }
+
+    /// Encode the public key to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.opaque[..MLKEM768_PUBLIC_KEY_BYTES].to_vec()
+    }
+}
+
+impl MLKEM768_private_key {
+    /// Generate a new ML-KEM768 keypair
+    pub fn generate() -> (Self, Vec<u8>) {
+        let mut private_key = std::mem::MaybeUninit::uninit();
+        let mut encoded_public_key = vec![0u8; MLKEM768_PUBLIC_KEY_BYTES];
+
+        unsafe {
+            MLKEM768_generate_key(
+                encoded_public_key.as_mut_ptr(),
+                std::ptr::null_mut(), // No seed output needed
+                private_key.as_mut_ptr(),
+            );
+            (private_key.assume_init(), encoded_public_key)
+        }
+    }
+
+    /// Get the public key corresponding to this private key
+    pub fn public_key(&self) -> MLKEM768_public_key {
+        let mut public_key = std::mem::MaybeUninit::uninit();
+        unsafe {
+            MLKEM768_public_from_private(public_key.as_mut_ptr(), self as *const _);
+            public_key.assume_init()
+        }
+    }
+
+    /// Encapsulate to encoded public key bytes
+    /// Returns (shared_secret, ciphertext)
+    pub fn encapsulate_to_bytes(
+        encoded_pubkey: &[u8],
+    ) -> Result<([u8; MLKEM_SHARED_SECRET_BYTES], Vec<u8>)> {
+        if encoded_pubkey.len() != MLKEM768_PUBLIC_KEY_BYTES {
+            return Err(Error::CryptoFail);
+        }
+
+        unsafe {
+            // Create public key structure from encoded bytes
+            // The opaque structure starts with the encoded form
+            let mut public_key: MLKEM768_public_key = std::mem::zeroed();
+            std::ptr::copy_nonoverlapping(
+                encoded_pubkey.as_ptr(),
+                public_key.opaque.as_mut_ptr(),
+                MLKEM768_PUBLIC_KEY_BYTES,
+            );
+
+            let mut ciphertext = vec![0u8; MLKEM768_CIPHERTEXT_BYTES];
+            let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
+
+            MLKEM768_encap(
+                ciphertext.as_mut_ptr(),
+                shared_secret.as_mut_ptr(),
+                &public_key as *const _,
+            );
+
+            Ok((shared_secret, ciphertext))
+        }
+    }
+
+    /// Decapsulate: extract shared secret from ciphertext
+    pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; MLKEM_SHARED_SECRET_BYTES]> {
+        if ciphertext.len() != MLKEM768_CIPHERTEXT_BYTES {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
+
+        let rc = unsafe {
+            MLKEM768_decap(
+                shared_secret.as_mut_ptr(),
+                ciphertext.as_ptr(),
+                ciphertext.len(),
+                self as *const _,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(shared_secret)
+    }
 }

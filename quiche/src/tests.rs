@@ -52,6 +52,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        pqdr_quic_supported: false,
         unknown_params: Default::default(),
     };
 
@@ -82,6 +83,7 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        pqdr_quic_supported: false,
         unknown_params: Default::default(),
     };
 

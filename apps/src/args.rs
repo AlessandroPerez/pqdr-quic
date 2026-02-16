@@ -297,6 +297,7 @@ Options:
   --qpack-blocked-streams STREAMS   Limit of blocked streams while decoding. Any value other that 0 is currently unsupported.
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
+  --disable-pqdr           Disable PQDR-QUIC (use standard QUIC only).
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   -h --help                Show this screen.
@@ -319,6 +320,7 @@ pub struct ClientArgs {
     pub source_port: u16,
     pub perform_migration: bool,
     pub send_priority_update: bool,
+    pub disable_pqdr: bool,
 }
 
 impl Args for ClientArgs {
@@ -396,6 +398,8 @@ impl Args for ClientArgs {
 
         let send_priority_update = args.get_bool("--send-priority-update");
 
+        let disable_pqdr = args.get_bool("--disable-pqdr");
+
         ClientArgs {
             version,
             dump_response_path,
@@ -412,6 +416,7 @@ impl Args for ClientArgs {
             source_port,
             perform_migration,
             send_priority_update,
+            disable_pqdr,
         }
     }
 }
@@ -434,6 +439,7 @@ impl Default for ClientArgs {
             source_port: 0,
             perform_migration: false,
             send_priority_update: false,
+            disable_pqdr: false,
         }
     }
 }
@@ -473,6 +479,7 @@ Options:
   --qpack-blocked-streams STREAMS   Limit of streams that can be blocked while decoding. Any value other that 0 is currently unsupported.
   --disable-gso               Disable GSO (linux only).
   --disable-pacing            Disable pacing (linux only).
+  --disable-pqdr              Disable PQDR-QUIC (use standard QUIC only).
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
   -h --help                   Show this screen.
@@ -488,6 +495,7 @@ pub struct ServerArgs {
     pub key: String,
     pub disable_gso: bool,
     pub disable_pacing: bool,
+    pub disable_pqdr: bool,
     pub enable_pmtud: bool,
 }
 
@@ -503,6 +511,7 @@ impl Args for ServerArgs {
         let key = args.get_str("--key").to_string();
         let disable_gso = args.get_bool("--disable-gso");
         let disable_pacing = args.get_bool("--disable-pacing");
+        let disable_pqdr = args.get_bool("--disable-pqdr");
         let enable_pmtud = args.get_bool("--enable-pmtud");
 
         ServerArgs {
@@ -514,6 +523,7 @@ impl Args for ServerArgs {
             key,
             disable_gso,
             disable_pacing,
+            disable_pqdr,
             enable_pmtud,
         }
     }

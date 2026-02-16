@@ -197,6 +197,42 @@ impl Open {
         })
     }
 
+    /// Create a new Open with a custom message key for packet encryption,
+    /// but preserve the original header protection key.
+    /// This is used for PQDR-QUIC where each packet uses a different message key
+    /// but header protection remains constant.
+    pub fn from_message_key(&self, message_key: &[u8]) -> Result<Open> {
+        let packet_key =
+            PacketKey::from_secret(self.alg, message_key, Self::DECRYPT)?;
+
+        Ok(Open {
+            alg: self.alg,
+
+            secret: message_key.to_vec(),
+
+            header: self.header.clone(),
+
+            packet: packet_key,
+        })
+    }
+
+    /// Create an Open directly from PQDR ratchet-derived key (BLAKE3 output).
+    /// This bypasses expensive HKDF operations for better performance.
+    /// Only the packet key is created - header protection should be handled separately.
+    pub fn from_pqdr_ratchet_key(ratchet_key: &[u8; 32]) -> Result<Open> {
+        let packet_key = PacketKey::from_pqdr_ratchet_key(ratchet_key)?;
+
+        // Dummy header protection key - won't be used since PQDR uses separate HP
+        let dummy_hp = HeaderProtectionKey::ChaCha(vec![0u8; 32]);
+
+        Ok(Open {
+            alg: Algorithm::ChaCha20_Poly1305,
+            secret: ratchet_key.to_vec(),
+            header: dummy_hp,
+            packet: packet_key,
+        })
+    }
+
     pub fn open_with_u64_counter(
         &self, counter: u64, ad: &[u8], buf: &mut [u8],
     ) -> Result<usize> {
@@ -285,6 +321,42 @@ impl Seal {
             header: self.header.clone(),
 
             packet: next_packet_key,
+        })
+    }
+
+    /// Create a new Seal with a custom message key for packet encryption,
+    /// but preserve the original header protection key.
+    /// This is used for PQDR-QUIC where each packet uses a different message key
+    /// but header protection remains constant.
+    pub fn from_message_key(&self, message_key: &[u8]) -> Result<Seal> {
+        let packet_key =
+            PacketKey::from_secret(self.alg, message_key, Self::ENCRYPT)?;
+
+        Ok(Seal {
+            alg: self.alg,
+
+            secret: message_key.to_vec(),
+
+            header: self.header.clone(),
+
+            packet: packet_key,
+        })
+    }
+
+    /// Create a Seal directly from PQDR ratchet-derived key (BLAKE3 output).
+    /// This bypasses expensive HKDF operations for better performance.
+    /// Only the packet key is created - header protection should be handled separately.
+    pub fn from_pqdr_ratchet_key(ratchet_key: &[u8; 32]) -> Result<Seal> {
+        let packet_key = PacketKey::from_pqdr_ratchet_key(ratchet_key)?;
+
+        // Dummy header protection key - won't be used since PQDR uses separate HP
+        let dummy_hp = HeaderProtectionKey::ChaCha(vec![0u8; 32]);
+
+        Ok(Seal {
+            alg: Algorithm::ChaCha20_Poly1305,
+            secret: ratchet_key.to_vec(),
+            header: dummy_hp,
+            packet: packet_key,
         })
     }
 
@@ -519,6 +591,132 @@ pub fn verify_slices_are_equal(a: &[u8], b: &[u8]) -> Result<()> {
     Err(Error::CryptoFail)
 }
 
+/// Fast PQDR encryption using BoringSSL ChaCha20-Poly1305.
+/// Stack allocation with EVP_AEAD - faster than raw primitives.
+pub fn pqdr_seal(
+    key: &[u8; 32], counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
+) -> Result<usize> {
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    // Stack-allocate EVP_AEAD_CTX (608 bytes)
+    let mut ctx: MaybeUninit<EVP_AEAD_CTX_ST> = MaybeUninit::uninit();
+
+    // Initialize context with key
+    let ctx = unsafe {
+        let aead = EVP_aead_chacha20_poly1305();
+
+        let rc = EVP_AEAD_CTX_init(
+            ctx.as_mut_ptr(),
+            aead,
+            key.as_ptr(),
+            32, // key length
+            16, // tag length
+            ptr::null_mut(),
+        );
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        ctx.assume_init()
+    };
+
+    // Construct nonce from counter
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+
+    // Encrypt in-place
+    let mut out_len = 0usize;
+    let max_out_len = in_len + 16; // plaintext + tag
+
+    let rc = unsafe {
+        EVP_AEAD_CTX_seal(
+            &ctx,
+            buf.as_mut_ptr(),
+            &mut out_len,
+            max_out_len,
+            nonce.as_ptr(),
+            12,
+            buf.as_ptr(),
+            in_len,
+            ad.as_ptr(),
+            ad.len(),
+        )
+    };
+
+    // Cleanup context
+    unsafe { EVP_AEAD_CTX_cleanup(&ctx as *const _ as *mut _) };
+
+    if rc != 1 {
+        return Err(Error::CryptoFail);
+    }
+
+    Ok(out_len)
+}
+
+/// Fast PQDR decryption using BoringSSL ChaCha20-Poly1305.
+pub fn pqdr_open(
+    key: &[u8; 32], counter: u64, ad: &[u8], buf: &mut [u8],
+) -> Result<usize> {
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    // Stack-allocate EVP_AEAD_CTX
+    let mut ctx: MaybeUninit<EVP_AEAD_CTX_ST> = MaybeUninit::uninit();
+
+    // Initialize context with key
+    let ctx = unsafe {
+        let aead = EVP_aead_chacha20_poly1305();
+
+        let rc = EVP_AEAD_CTX_init(
+            ctx.as_mut_ptr(),
+            aead,
+            key.as_ptr(),
+            32,
+            16,
+            ptr::null_mut(),
+        );
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        ctx.assume_init()
+    };
+
+    // Construct nonce from counter
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+
+    // Decrypt in-place
+    let mut out_len = 0usize;
+
+    let rc = unsafe {
+        EVP_AEAD_CTX_open(
+            &ctx,
+            buf.as_mut_ptr(),
+            &mut out_len,
+            buf.len(),
+            nonce.as_ptr(),
+            12,
+            buf.as_ptr(),
+            buf.len(),
+            ad.as_ptr(),
+            ad.len(),
+        )
+    };
+
+    // Cleanup context
+    unsafe { EVP_AEAD_CTX_cleanup(&ctx as *const _ as *mut _) };
+
+    if rc != 1 {
+        return Err(Error::CryptoFail);
+    }
+
+    Ok(out_len)
+}
+
 extern "C" {
     fn EVP_sha256() -> *const EVP_MD;
 
@@ -666,6 +864,12 @@ mod tests {
         assert_eq!(&next_secret, &expected_secret);
     }
 }
+
+// BLAKE3-based key derivation for PQDR-QUIC
+pub mod blake3_kdf;
+
+// Double-ratchet for PQDR-QUIC
+pub mod ratchet;
 
 #[cfg(not(feature = "openssl"))]
 mod boringssl;

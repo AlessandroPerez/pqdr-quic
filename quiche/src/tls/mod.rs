@@ -142,6 +142,18 @@ impl Context {
 
             ctx.load_ca_certs()?;
 
+            // Configure post-quantum hybrid key exchange (X25519_MLKEM768) and fallbacks
+            // Try to set PQ groups, but don't fail if unsupported
+            let groups = ffi::CString::new("X25519_MLKEM768:X25519:P-256")
+                .map_err(|_| Error::TlsFail)?;
+            let _ = SSL_CTX_set1_groups_list(ctx.as_mut_ptr(), groups.as_ptr());
+
+            // Use HIGH cipher suite list (includes both AES-GCM and ChaCha20-Poly1305)
+            // TLS will negotiate the best cipher - typically AES-GCM with hardware acceleration
+            let ciphers = ffi::CString::new("HIGH:!aNULL:!eNULL")
+                .map_err(|_| Error::TlsFail)?;
+            map_result(SSL_CTX_set_cipher_list(ctx.as_mut_ptr(), ciphers.as_ptr()))?;
+
             Ok(ctx)
         }
     }
@@ -455,7 +467,7 @@ impl Handshake {
     pub fn set_quic_transport_params(
         &mut self, params: &crate::TransportParams, is_server: bool,
     ) -> Result<()> {
-        let mut raw_params = [0; 128];
+        let mut raw_params = [0; 256];
 
         let raw_params =
             crate::TransportParams::encode(params, is_server, &mut raw_params)?;
@@ -586,6 +598,30 @@ impl Handshake {
     pub fn clear(&mut self) -> Result<()> {
         let rc = unsafe { SSL_clear(self.as_mut_ptr()) };
         self.map_result_ssl(rc)
+    }
+
+    pub fn export_keying_material(
+        &self, label: &str, context: Option<&[u8]>, out: &mut [u8],
+    ) -> Result<()> {
+        let label_cstr = ffi::CString::new(label).map_err(|_| Error::TlsFail)?;
+
+        let (context_ptr, context_len, use_context) = match context {
+            Some(ctx) => (ctx.as_ptr(), ctx.len(), 1),
+            None => (ptr::null(), 0, 0),
+        };
+
+        map_result(unsafe {
+            SSL_export_keying_material(
+                self.as_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+                label_cstr.as_ptr(),
+                label.len(),
+                context_ptr,
+                context_len,
+                use_context,
+            )
+        })
     }
 
     fn as_ptr(&self) -> *const SSL {
@@ -1107,6 +1143,14 @@ extern "C" {
     #[cfg(windows)]
     fn SSL_CTX_get_cert_store(ctx: *mut SSL_CTX) -> *mut X509_STORE;
 
+    fn SSL_CTX_set_cipher_list(
+        ctx: *mut SSL_CTX, str: *const c_char,
+    ) -> c_int;
+
+    fn SSL_CTX_set1_groups_list(
+        ctx: *mut SSL_CTX, str: *const c_char,
+    ) -> c_int;
+
     fn SSL_CTX_set_verify(
         ctx: *mut SSL_CTX, mode: c_int,
         cb: Option<
@@ -1242,6 +1286,18 @@ extern "C" {
     // OPENSSL
     #[allow(dead_code)]
     fn OPENSSL_free(ptr: *mut c_void);
+
+    // Export keying material for PQDR-QUIC
+    fn SSL_export_keying_material(
+        ssl: *const SSL,
+        out: *mut u8,
+        out_len: usize,
+        label: *const c_char,
+        label_len: usize,
+        context: *const u8,
+        context_len: usize,
+        use_context: c_int,
+    ) -> c_int;
 
 }
 

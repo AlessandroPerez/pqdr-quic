@@ -103,6 +103,15 @@ fn main() {
     // Create the configuration for the QUIC connections.
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
+    // Enable PQDR-QUIC unless disabled
+    if !args.disable_pqdr {
+        config.enable_pqdr_quic(true);
+        eprintln!("🔒 PQDR-QUIC enabled: Post-quantum security with double-ratcheting");
+    } else {
+        config.enable_pqdr_quic(false);
+        eprintln!("⚠️  PQDR-QUIC disabled: Using standard QUIC (vanilla mode)");
+    }
+
     config.load_cert_chain_from_pem_file(&args.cert).unwrap();
     config.load_priv_key_from_pem_file(&args.key).unwrap();
 

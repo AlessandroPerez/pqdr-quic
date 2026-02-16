@@ -185,6 +185,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// PQDR-QUIC support (experimental parameter)
+    pub pqdr_quic_supported: bool,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -210,6 +212,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            pqdr_quic_supported: false,
             unknown_params: Default::default(),
         }
     }
@@ -368,6 +371,14 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                // PQDR-QUIC support (experimental parameter in private range)
+                0xFF00 => {
+                    if val.cap() != 1 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+                    tp.pqdr_quic_supported = val.get_u8()? != 0;
                 },
 
                 // Track unknown transport parameters specially.
@@ -553,6 +564,12 @@ impl TransportParams {
                 octets::varint_len(max_datagram_frame_size),
             )?;
             b.put_varint(max_datagram_frame_size)?;
+        }
+
+        // Encode PQDR-QUIC support parameter (experimental, private range)
+        if tp.pqdr_quic_supported {
+            TransportParams::encode_param(&mut b, 0xFF00, 1)?;
+            b.put_u8(1)?;
         }
 
         let out_len = b.off();
