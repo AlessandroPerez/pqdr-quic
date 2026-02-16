@@ -416,15 +416,11 @@ This matches the security model of secure messaging apps like Signal, applied to
 
 ### In Progress / Future Enhancements
 
-- [ ] Integration tests with full handshake simulation
-- [ ] Qlog visualization of ratchet events and key derivations
-- [ ] Support for ML-KEM serialization (CBS parsing for interop)
 - [ ] Migration to tokio-quiche (requires boring crate ML-KEM support)
 - [ ] Further optimization of EVP_AEAD_CTX initialization (investigate context pooling)
 - [ ] Adaptive ratchet intervals based on connection characteristics
 - [ ] Cross-implementation testing (interoperability with other PQDR implementations)
 - [ ] Memory-constrained device testing (IoT, mobile)
-- [ ] Extended security analysis and formal verification
 
 ## References
 
