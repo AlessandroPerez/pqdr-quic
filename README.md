@@ -2,7 +2,7 @@
 
 **A research fork of Cloudflare's quiche with post-quantum cryptography and Signal-style double ratchet**
 
-[![Performance](https://img.shields.io/badge/overhead-5.4%25-green)](PQDR-QUIC.md)
+[![Performance](https://img.shields.io/badge/overhead-2.0%25-green)](PQDR-QUIC.md)
 [![Security](https://img.shields.io/badge/PQ-ML--KEM--768-blue)](PQDR-QUIC.md)
 [![Ratchet](https://img.shields.io/badge/ratchet-60s-orange)](PQDR-QUIC.md)
 
@@ -14,7 +14,7 @@ PQDR-QUIC extends QUIC with:
 - **Post-Quantum Security**: ML-KEM-768 (NIST Level 3) every 60 seconds
 - **Forward Secrecy**: Per-packet BLAKE3 key derivation (~64ns overhead)
 - **Post-Compromise Recovery**: System healing within 60 seconds of compromise
-- **Minimal Overhead**: Only 5.4% performance impact (2327 → 2201 Mbps)
+- **Minimal Overhead**: Only ~2% performance impact (2352 → 2305 Mbps)
 
 📖 **[Complete PQDR Documentation](PQDR-QUIC.md)** - Architecture, security properties, benchmarks, and testing guide
 
@@ -38,15 +38,15 @@ dd if=/dev/urandom of=test-www/test_20gb.bin bs=1M count=20480
 | Post-Quantum | ❌ TLS 1.3 only | ✅ ML-KEM-768 |
 | Per-Packet Keys | ❌ TLS session key | ✅ BLAKE3 ratchet |
 | Compromise Recovery | ❌ None | ✅ 60s ML-KEM ratchet |
-| Performance | 2327 Mbps | 2201 Mbps (-5.4%) |
+| Performance | 2352 Mbps | 2305 Mbps (-2.0%) |
 | Cipher | AES-GCM (default) | ChaCha20-Poly1305 |
 
 ### Performance Results
 
-**20GB file transfer (5 runs each):**
-- Vanilla QUIC: 2327.41 Mbps (CV: 1.00%)
-- PQDR-QUIC: 2200.71 Mbps (CV: 1.00%)
-- **Overhead: 5.44%** ≈ 4.4 seconds for 20GB
+**20GB file transfer (10 runs each):**
+- Vanilla QUIC: 2351.75 Mbps mean / 2344.68 Mbps median (CV: 1.0%, download 69.68s avg)
+- PQDR-QUIC: 2304.77 Mbps mean / 2329.25 Mbps median (CV: 2.0%, download 71.11s avg)
+- **Overhead: ~2.0%** ≈ 1.4 seconds for 20GB
 
 **Per-packet cost:** ~250ns (64ns BLAKE3 + 186ns AEAD context init/cleanup)
 **Per-ratchet cost:** ~50μs ML-KEM-768 encapsulation

@@ -1,318 +1,386 @@
-# Implementation guide (quiche-based): PQDR-QUIC epochs + per-packet symmetric ratchet + QUIC Key Phase signaling
+# PQDR-QUIC Implementation Guide (quiche-based)
+**Server-segmented KEM public key · Client ciphertext via CRYPTO stream · Per-packet symmetric ratchet · QUIC Key Phase signaling**
 
-This guide assumes your current codebase uses **quiche** as the QUIC stack (Rust crate or C FFI). quiche is a **low-level QUIC transport + HTTP/3** implementation where your application drives I/O and timers. :contentReference[oaicite:0]{index=0}
+This document provides a complete, consistent implementation guide for integrating your design into a fork of **quiche** (Rust). The system consists of:
 
-The system you described has three main pieces:
+- **Epoch-based PQ asymmetric ratchet**
+  - Epoch duration: **60 seconds**
+  - Overlap retention: **5 seconds**
+  - **Server sends its KEM public key fragmented (19 packets)**
+  - **Client sends ciphertext via QUIC CRYPTO stream at ~55s**
+  - Server decapsulates locally
+  - Epoch switch at boundary (no more than 2 epochs stored)
 
-1) **Symmetric per-packet ratchet (two directional chains):**
-   - C→S chain and S→C chain.
-   - Packet keys are derived *per packet number* and used with **ChaCha20-Poly1305** AEAD.
-   - Out-of-order handling uses bounded skip + cached gap keys.
+- **Symmetric per-packet ratchet**
+  - Two directional chains (C→S and S→C)
+  - Fresh AEAD key per packet number
+  - ChaCha20-Poly1305 packet protection
 
-2) **Asymmetric PQ “epoch pipeline” (server encapsulates one epoch ahead):**
-   - Epoch length = 60s.
-   - Client sends **pk for epoch e+1** early in epoch e (fragmented over first 19 packets).
-   - Server encapsulates during epoch e and sends **ct for epoch e+1** early in epoch e+1 (fragmented over first 19 packets).
-   - Client locally decapsulates once ct is complete (decapsulation is *not a message*, it is local computation in KEM-based protocols). :contentReference[oaicite:1]{index=1}
-   - Client sends a **key-confirm / commit** around 55s (CRYPTO frame) so the server has ~5s to retry missing fragments.
+- **Epoch signaling**
+  - Use QUIC **Key Phase bit**
+  - `key_phase = epoch_id mod 2`
 
-3) **Epoch switch signaling via QUIC Key Phase bit:**
-   - Use QUIC’s Key Phase bit (short header) as the on-wire signal “I’m using the next epoch keys now”.
-   - Your “≤ 2 epochs stored” invariant holds because you retain old keys for only 5s.
+This guide assumes you are modifying quiche internals (fork-based approach).
 
----
+# 1. System Overview
 
-## 0) Before you code: decide where crypto lives
+## 1.1 Epoch Timeline
 
-You have two implementation paths:
+Let epoch `e` run from:
 
-### Path A (recommended for research/prototype): fork quiche
-You modify quiche’s packet protection logic to:
-- derive traffic keys from *your* epoch+ratchet state instead of standard QUIC TLS secrets/key updates.
+```
+t = 0s → 60s
+```
 
-Pros: correct Key Phase behavior, minimal duplication, clean integration with QUIC internals.  
-Cons: maintenance + you must keep the fork rebased.
+### During Epoch e:
 
-### Path B (application overlay, no quiche fork): run your ratchet above QUIC streams
-You leave QUIC packet protection unchanged and instead:
-- add an “inner AEAD” that encrypts stream payloads with your per-packet keys.
+| Time | Action |
+|------|--------|
+| 0s | Server generates `(pkS[e+1], skS[e+1])` |
+| First 19 packets | Server sends `pkS[e+1]` fragments |
+| Before 55s | Client encapsulates using `pkS[e+1]` |
+| ~55s | Client sends `ct[e+1]` via QUIC CRYPTO stream |
+| 60s | Both sides switch to epoch `e+1` keys |
+| 60s–65s | Previous epoch retained for reordering |
+| ≥65s | Epoch `e` keys deleted |
 
-Pros: no fork, fastest to integrate.  
-Cons: you don’t actually change QUIC packet protection (Key Phase bit becomes less meaningful), and your security story becomes “double encryption” not “new QUIC crypto”.
+**Invariant:** At most **two epochs** exist in memory at any time.
 
-**Given you want to use the Key Phase bit and QUIC packet-level semantics, you want Path A.** The rest of this guide assumes **Path A**.
+# 2. Asymmetric PQ Epoch Ratchet
 
----
+## 2.1 Server Behavior
 
-## 1) Define your wire format (frames) + negotiation
+### At Start of Epoch e
 
-QUIC allows new frame types, but you must avoid collisions and negotiate support (e.g., transport parameter, ALPN, or version). Start simple:
+Generate next-epoch KEM keypair:
 
-### 1.1 Frame types
-Define 3 extension frames:
+```
+(pkS[e+1], skS[e+1]) = KEM.KeyGen()
+```
 
-- `PQR_PK_FRAG` (client → server): fragments of `pkC[e+1]`
-- `PQR_CT_FRAG` (server → client): fragments of `ct[e+1]`
-- `PQR_KEY_CONFIRM` (client → server): small confirmation token for epoch e+1
+Store `skS[e+1]` securely.
 
-### 1.2 Encode fields
-For all fragments:
-- `epoch_id` (varint)
-- `frag_idx` (varint)
-- `frag_len` (varint)
-- `frag_bytes` (frag_len bytes)
+### First 19 Packets of Epoch e
 
-For KEY_CONFIRM:
-- `epoch_id` (varint)
-- `kc_len` (varint)
-- `kc_bytes` (kc_len bytes)
+Prepend a 64-byte pubkey chunk to each packet's plaintext before encryption:
 
-### 1.3 Negotiation
-Pick one:
-- custom QUIC version (research-friendly), or
-- a transport parameter “pqr_enabled=1”, or
-- ALPN suffix (e.g., `h3-pqdr`).
+```
+packet_plaintext = pubkey_chunk[frag_idx] || application_payload
+```
 
-Do not accept these frames unless negotiated.
+- `frag_idx` 0..18 (in packet-number order)
+- Each chunk is exactly 64 bytes; chunk 18 is zero-padded to 64 bytes (ML-KEM-768 pubkey = 1184 bytes = 18×64 + 32)
+- No separate wire frame — the chunk is authenticated and encrypted as part of the packet payload
+- Receiver reassembles chunks ordered by packet number and strips them from the decrypted plaintext
 
----
+## 2.2 Client Behavior
 
-## 2) Data structures you’ll need
+### Upon Receiving All 19 Fragments
 
-### 2.1 Epoch manager (per connection)
-Keep only two epochs worth of secrets:
+Reassemble:
 
-```text
-EpochState {
-  epoch_id: u64
-  start_time: Instant
-  ss_epoch: [u8; 32]          // or 64, depends on your KDF
-  ck_c2s: [u8; 32]
-  ck_s2c: [u8; 32]
-  recv_cache_c2s: Map<pn, pk> // bounded
-  recv_cache_s2c: Map<pn, pk> // bounded
-  max_derived_pn_c2s: u64
-  max_derived_pn_s2c: u64
+```
+pkS[e+1]
+```
+
+Then compute:
+
+```
+(ct[e+1], ssPQ[e+1]) = KEM.Encaps(pkS[e+1])
+```
+
+Store `ssPQ[e+1]`.
+
+### At ~55s of Epoch e
+
+Send the ciphertext as raw bytes via the QUIC **CRYPTO stream** (application epoch):
+
+```
+CRYPTO stream payload = ct[e+1]   (1088 bytes, ML-KEM-768 ciphertext)
+```
+
+Only one ciphertext is sent. No custom frame type — standard QUIC CRYPTO frame carries the bytes.
+
+## 2.3 Server Upon Receiving Ciphertext
+
+Upon reading 1088 bytes from the QUIC CRYPTO stream (application epoch):
+
+Compute:
+
+```
+ssPQ[e+1] = KEM.Decaps(skS[e+1], ct[e+1])
+```
+
+Decapsulation is local computation only.
+
+# 3. Epoch Secret Derivation
+
+At boundary `t = 60s`, with `starting_pn` = first QUIC packet number of the new epoch:
+
+```
+prk = BLAKE3-HKDF-Extract(
+    salt = starting_pn (8 bytes, big-endian),
+    ikm  = ssPQ[e+1]
+)
+
+(CK_send, CK_recv) = BLAKE3-HKDF-Expand(prk, "pqdr-epoch-chains", 64 bytes)
+    CK_send = output[0..32]
+    CK_recv = output[32..64]
+```
+
+Server swaps: `server_send = CK_recv`, `server_recv = CK_send` (so server-send == client-recv).
+
+There is **no chaining from the previous epoch's shared secret** — the KEM `ssPQ[e+1]` alone seeds the new chains, bound to the epoch boundary via `starting_pn`.
+
+# 4. Symmetric Per-Packet Ratchet
+
+Two independent chains:
+
+- `CK_c2s`
+- `CK_s2c`
+
+## 4.1 Initialization
+
+**Epoch 0** (from TLS handshake secret):
+
+```
+root = BLAKE3-HKDF-Expand(BLAKE3(handshake_secret), "pqdr-quic-init", 32 bytes)
+prk  = BLAKE3-HKDF-Extract(salt=root, ikm=b"initial")
+
+(CK_a, CK_b) = BLAKE3-HKDF-Expand(prk, "pqdr-quic-chains", 64 bytes)
+    CK_a = output[0..32]
+    CK_b = output[32..64]
+
+Client: send=CK_a, recv=CK_b
+Server: send=CK_b, recv=CK_a   (swapped so server-send == client-recv)
+```
+
+**Epoch N≥1** (from KEM shared secret; see Section 3):
+
+```
+Client: send=CK_a, recv=CK_b    (same orientation as epoch 0)
+Server: send=CK_b, recv=CK_a
+```
+
+Chain PN cursors are **not** reset symmetrically at epoch boundaries:
+- Server→client direction resets to `starting_pn`
+- Client→server direction continues from epoch N-1 (independent pn space)
+
+## 4.2 Per-Packet Derivation
+
+For packet number `pn`:
+
+```
+output = BLAKE3-keyed-XOF(key=CK_dir, data=BE64(pn), output_len=64)
+
+CK_next = output[0..32]
+PK[pn]  = output[32..64]
+```
+
+Update:
+
+```
+CK_dir = CK_next
+```
+
+Use `PK[pn]` as ChaCha20-Poly1305 key.
+
+Notes:
+- `pn` is encoded as **8-byte big-endian** (no direction label, no "STEP" prefix)
+- `CK_dir` is used as the 32-byte BLAKE3 keyed-hash key
+- The XOF produces 64 bytes via `finalize_xof().fill()`
+
+## 4.3 Nonce
+
+```
+nonce = [0x00; 12]   (12 zero bytes, always)
+```
+
+The nonce is fixed at zero because **the key itself changes every packet**. Nonce reuse is only dangerous when the same key is reused; since every packet uses a unique `PK[pn]`, the `(key, nonce)` pair is never repeated.
+
+This differs from the original design intent (`encode96(pn)`). The security guarantee is equivalent — each `(key=PK[pn], nonce=0)` pair is unique.
+
+## 4.4 Out-of-Order Receive
+
+Maintain per direction:
+
+```
+max_derived_pn
+cache[pn] -> PK[pn]
+```
+
+Algorithm:
+
+1. If `pn <= max_derived_pn`:
+   - Use cached key (if exists)
+2. If `pn > max_derived_pn`:
+   - If `pn - max_derived_pn > MAX_SKIP_PN` → drop
+   - Else derive sequentially up to `pn`
+   - Cache intermediate keys
+
+Deletion:
+- Remove cached keys when outside reordering window
+- Remove entire cache when epoch expires
+
+# 5. Packet Protection (AEAD)
+
+Use:
+
+```
+ChaCha20-Poly1305
+```
+
+Encrypt:
+
+```
+ciphertext = AEAD_Seal(
+    key   = PK[pn],
+    nonce = nonce,
+    aad   = authenticated_header,
+    pt    = payload
+)
+```
+
+Decrypt:
+
+```
+plaintext = AEAD_Open(...)
+```
+
+Failure behavior must be constant-time and uniform.
+
+# 6. Epoch Management State
+
+## 6.1 Structures
+
+```
+RatchetState {
+    is_server: bool
+
+    // Send chain (own outgoing direction)
+    send_chain_key: [u8; 32]
+    send_chain_pn:  u64
+
+    // Receive chain (peer's outgoing direction)
+    recv_chain_key: [u8; 32]
+    recv_chain_pn:  u64
+
+    // Skipped receive keys for out-of-order packets
+    skipped_recv_keys:  HashMap<(epoch, pn), [u8; 32]>
+
+    // Previous epoch receive state (5s TTL)
+    prev_epoch_recv: Option<PrevEpochRecv {
+        chain_key, chain_pn, skipped, expires
+    }>
+
+    // Pre-computed next epoch (activated at t=60s)
+    precomputed_next_epoch: Option<{epoch, shared_secret}>
+
+    // KEM state
+    pending_ratchet: Option<WaitingForCiphertext | WaitingToActivate>
+    incoming_pubkey_chunks: HashMap<pkt_num, chunk>
+    outgoing_chunks: Option<Vec<chunk>>
+    pending_ciphertext_response: Option<(epoch, ciphertext)>
 }
-ConnectionEpochs {
-  current: EpochState
-  previous: Option<EpochState> // retained <= 5 seconds
-  next_ready: Option<NextEpochMaterial> // computed but not active
-}
 ```
 
-### 2.2 PQ pipeline buffers
 
-```
-PkReassembly[e+1]: fragments[0..18] -> pkC[e+1]
-CtReassembly[e+1]: fragments[0..18] -> ct[e+1]
-```
+At `t >= start_time + 60s`:
 
-Hard limits (important for DoS):
+1. `previous = current`
+2. Activate `current = new_epoch`
+3. Flip Key Phase bit
+4. Schedule deletion of `previous` at `+5s`
 
-- `MAX_EPOCHS_IN_FLIGHT = 2`
-- `MAX_FRAG_BYTES_TOTAL_PER_EPOCH`
-- `MAX_SKIP_PN` for ratchet fast-forward
-- `MAX_CACHED_KEYS` per direction
+At `t >= start_time_new + 5s`:
 
-Cloudflare has published multiple reminders that QUIC stacks must defensively validate peer signals (e.g., ACK ranges) to avoid resource attacks; apply the same mindset to your custom frames.
+- Securely delete `previous`
 
-## 3 Cryptographic spec you implement (concrete)
-### 3.1 Per-packet symmetric ratchet (directional)
+# 7. QUIC Key Phase Integration
 
-Two independent chains: `ck_c2s` and `ck_s2c`.
-
-Per packet number `pn` (for a given direction):
-- `step = BLAKE3(key=ck, input="STEP" || dir_id || LE64(pn))` → 64 bytes
-- `ck_next = step[0..31]`
-- `pk[pn] = step[32..63]` (32B ChaCha20-Poly1305 key)
-- update `ck = ck_next` after deriving
-
-Receiver out-of-order:
-- if `pn > max_derived_pn`: derive sequentially up to `pn`, caching gap keys (bounded).
-- if `pn - max_derived_pn > MAX_SKIP_PN`: drop.
-
-Nonce:
-- `nonce = encode96(pn)` (12 bytes) is sufficient since each packet has a fresh key.
-
-AEAD:
-- ChaCha20-Poly1305 with `AAD = QUIC header fields you authenticate` (decide exactly which ones, consistently).
-- Use a single constant-time failure path.
-
-### 3.2 Epoch derivation
-Epoch length = 60s. Overlap retention = 5s.
-- At epoch start, `ss_epoch` seeds both chains:
-    - `ck_c2s = KDF(ss_epoch, "CK0" || "c2s")`
-    - `ck_s2c = KDF(ss_epoch, "CK0" || "s2c")`
-
-When PQ pipeline for epoch e+1 completes:
-- `ss_pq[e+1]` comes from KEM:
-    - server: `Encaps(pkC[e+1]) -> (ct[e+1], ss_pq[e+1])`
-    - client: `Decaps(skC[e+1], ct[e+1]) -> ss_pq[e+1]` (local)
-
-Then finalize next epoch secret:
-- `ss_epoch[e+1] = KDF(ss_epoch[e], "EPOCH" || (e+1) || ss_pq[e+1])`
-
-## 4 Timeline: what runs when (the pipeline)
-### 4.1 Client actions (epoch e)
-
-**At start of epoch e:**
-1. Generate `(pkC[e+1], skC[e+1])`
-
-**Packets 0..18 of epoch e:**
-2. Send `PQR_PK_FRAG(epoch=e+1, frag_idx=i, frag=pk_fragment_i)`
-
-**At ~55s of epoch e+1 (not e):**
-3. After you have decapsulated `ct[e+1]`, send `PQR_KEY_CONFIRM(epoch=e+1, KC)` inside a QUIC CRYPTO frame (as you planned).
-
-Key confirm:
-- `KC = KDF(ss_pq[e+1], "KC" || (e+1) || transcript_hash)[0..31]`
-- transcript_hash should cover:
-    - all pk and ct fragments (or hashes thereof),
-    - connection identifiers relevant to bind to this connection,
-    - epoch_id.
-
-### 4.2 Server actions (epoch e)
-**Upon receiving all pk fragments for epoch e+1:**
-1. Reassemble `pkC[e+1]`
-2. Compute `(ct[e+1], ss_pq[e+1]) = Encaps(pkC[e+1])`
-3. Store `(ct[e+1], ss_pq[e+1])` until epoch e+1.
-
-**Packets 0..18 of epoch e+1:**
-4. Send `PQR_CT_FRAG(epoch=e+1, frag_idx=i, frag=ct_fragment_i)`
-
-**At ~55s of epoch e+1:**
-5. Expect KEY_CONFIRM. If missing, retransmit missing ct fragments (or all 19) during last 5 seconds.
-
-## 5 Using QUIC Key Phase bit for epoch switch
 Define:
-- `key_phase(epoch e) = e mod 2`
-
-**Sender rule (both sides):**
-- At time boundary start(epoch e+1), start encrypting with epoch e+1 keys and set Key Phase bit accordingly.
-
-**Receiver rule:**
-- If Key Phase matches current epoch: try decrypt with `current`.
-- Else: try decrypt with `previous ` (late packet).
-- If both fail, drop.
-
-Because you delete keys older than 5s, you’ll never have more than two epochs resident (previous/current), and Key Phase parity stays unambiguous.
-
-(QUIC Key Phase is header-protected and used exactly to indicate which 1-RTT keys protect the packet. See RFC 9001 for QUIC/TLS packet protection and key update behavior.)
-
-## 6 Where to hook this into quiche (fork plan)
-quiche’s public API gives you `conn.recv()` and `conn.send()` loops; packet protection happens inside quiche.
-So you’ll be editing quiche internals roughly like this:
-
-### 6.1 Locate crypto / packet protection module
-In the quiche source tree, find the module(s) that:
-- derive traffic keys (from TLS secrets),
-- apply header protection,
-- apply payload protection (AEAD),
-- manage key updates (Key Phase flipping).
-
-(If you’re using the Rust crate, start by browsing `src/crypto/` and packet handling paths in the repo.)
-
-### 6.2 Replace/extend traffic key schedule
-Implement a new key schedule backend:
-- `EpochKeyManager` that owns `ConnectionEpochs`.
-- Expose methods:
-  - `protect_packet(pn, header, plaintext) -> ciphertext`
-  - `unprotect_packet(pn, header, ciphertext) -> plaintext or fail`
-  - `on_epoch_boundary(now)`
-  - `on_pk_frag(...)`, `on_ct_frag(...)`, `on_key_confirm(...)`
-
-### 6.3 Add parsing/emission for extension frames
-- Add frame parsing cases for your frame types.
-- Ensure they are only accepted post-negotiation.
-- Feed fragments into `PkReassembly `/ `CtReassembly`.
-
-### 6.4 Connect CRYPTO-frame carriage
-You said KEY_CONFIRM will go inside a CRYPTO frame. Two approaches:
-- simplest: make KEY_CONFIRM an extension frame carried like any other (STREAM/Datagram payload) rather than true TLS CRYPTO.
-- if you insist on CRYPTO frame: you must inject it into QUIC’s CRYPTO stream machinery (which is normally TLS handshake). This is doable but invasive; you must ensure you don’t break TLS handshake parsing.
-
-For a thesis prototype, I strongly recommend: make KEY_CONFIRM a regular extension frame, not CRYPTO. It achieves the same “reliable, retransmittable, ordered” behavior if you send it on a reliable stream or QUIC DATAGRAM with your own retry logic.
-
-### 6.5 Key Phase bit control
-Ensure the short header Key Phase bit is set based on `epoch_id mod 2` for 1-RTT packets.
-- quiche already knows how to set/protect this bit; you just control the “current phase” variable based on your epoch timer.
-
-## 7 Timers and state machine (what to implement)
-### 7.1 Epoch timer
-Maintain:
-- `epoch_start_time`
-- `epoch_id`
-
-On tick:
-- if `now >= epoch_start + 60s`: advance epoch:
-  - move `current -> previous`
-  - activate `next_ready` as new `current`
-  - clear `next_ready`
-  - schedule deletion of `previous` at `epoch_start + 5s`
-
-### 7.2 Retry windows
-- `t=0..(small)` of epoch e: pk/ct fragments
-- `t≈55s`: KEY_CONFIRM should be sent/received
-- `t=55..60s`: retransmit missing fragments if needed
-
-### 7.3 Key deletion
-At `now >= start(epoch e) + 5s`:
-- delete all secrets + caches for epoch e-1.
-
-## 8 Testing plan (do this early)
-### 8.1 Deterministic unit tests
-- Ratchet derivation:
-  - known `ss_epoch` and pn sequence -> exact keys.
-  - out-of-order receives produce identical keys and correct cache behavior.
-
-- Epoch transitions:
-  - epoch parity -> Key Phase bit mapping.
-  - two-epoch invariant.
-
-### 8.2 Integration tests with loss/reordering
-Simulate network:
-- reorder first 19 packets, drop random fragments, delay them into overlap window.
-- verify:
-  - ct reassembly completes before 55s with high probability,
-  - retransmission recovers failures,
-  - decryption works across boundary, and old epoch packets decrypt for ≤5s.
-
-### 8.3 qlog / tracing
-Add logs for:
-- epoch changes
-- key phase changes
-- fragment reception bitmap (19 bits)
-- KEY_CONFIRM sent/received
-- ratchet skip count and cache size
-
-## 9 Security checklist (quick but non-negotiable)
-- **Uniform AEAD failure behavior**: same error path, no differing alerts.
-- **Bounds everywhere**: MAX_SKIP_PN, MAX_CACHE_KEYS, MAX_FRAG_BYTES, MAX_EPOCHS_IN_FLIGHT.
-- **Transcript binding**: KEY_CONFIRM must bind epoch_id + fragments to prevent replay across epochs/connections.
-- **Erase secrets**: zeroize ss/ck/pk buffers on deletion.
-- **No epoch fast-forward**: never allow skipping >1 epoch ahead; parity would become ambiguous.
-
-## 10 Practical “first milestone” implementation order
-1. Implement symmetric ratchet (derive keys, AEAD encrypt/decrypt) in isolation.
-2. Integrate ratchet into quiche packet protection (fork), without PQ pipeline:
-  - epoch 0 only, fixed ss_epoch.
-  - Key Phase stays constant.
-
-3. Add epoch timer + Key Phase flip + two-epoch retention.
-4. Add PK/CT fragmentation frames + reassembly.
-5. Add server encapsulation pipeline (epoch e computes epoch e+1).
-6. Add KEY_CONFIRM and retry logic.
-7. Harden bounds + run loss/reorder integration tests.
-8. Write down the final state machine + frame specs for the thesis.
-
-**Notes on references**
-- quiche low-level design and API shape (app-driven I/O loop) ([https://github.com/cloudflare/quiche?utm_source=chatgpt.com])
-- QUIC/TLS packet protection and key update concepts (RFC 9001) ([https://datatracker.ietf.org/doc/rfc9001/?utm_source=chatgpt.com])
-- decapsulation is local (KEM integration pattern) ([https://datatracker.ietf.org/doc/rfc9001/?utm_source=chatgpt.com])
-- defensive validation mindset for QUIC inputs (ACK-range issue postmortem) ([https://blog.cloudflare.com/defending-quic-from-acknowledgement-based-ddos-attacks/?utm_source=chatgpt.com])
 
 ```
-If you tell me whether you’re using **Rust quiche directly** or the **C FFI** (quiche.h), I can add a short “project skeleton” section that matches your build style (Cargo workspace vs CMake) and point to the exact spots in the quiche send/recv loop where you’ll instrument epoch timers and logs.
-::contentReference[oaicite:10]{index=10}
+key_phase = epoch_id mod 2
 ```
+
+## Sender
+
+- Set short header Key Phase bit accordingly.
+
+## Receiver
+
+Upon receiving packet:
+
+1. If KP matches current → try current keys
+2. Else if matches previous → try previous keys
+3. Else drop
+
+Never allow more than 1 future epoch in memory.
+
+# 8. Integration into quiche
+
+## 8.1 Modify Packet Protection
+
+Replace standard 1-RTT key derivation with:
+
+```
+EpochKeyManager::derive_packet_key(dir, pn)
+```
+
+Hook into:
+- encrypt path
+- decrypt path
+- key update logic
+
+## 8.2 KEM Material Integration
+
+Pubkey chunks arrive as **plaintext prefixes** on the first 19 incoming application packets each epoch:
+- After PQDR decryption, strip the leading 64 bytes and pass to `ratchet.receive_pubkey_chunk(pkt_num, chunk)`
+- Once all 19 chunks are collected, `respond_to_ratchet()` is called to encapsulate
+
+Ciphertext is sent/received via the standard **QUIC CRYPTO stream** (application epoch):
+- Client: write 1088 raw bytes to `crypto_stream.send` at t≈55s
+- Server: read from `crypto_stream.recv` and call `store_and_precompute_from_ciphertext()`
+
+No custom frame type is needed.
+
+## 8.3 Add Epoch Timer
+
+Hook into quiche timer system:
+
+- Check boundary condition
+- Perform epoch transition
+- Flip Key Phase
+
+# 9. Security Bounds
+
+Define hard limits:
+
+```
+MAX_SKIP_PN
+MAX_CACHED_KEYS
+MAX_FRAGMENTS = 19
+MAX_EPOCHS_IN_MEMORY = 2
+```
+
+Reject:
+- Unexpected epoch IDs
+- Duplicate fragment indices
+- Overlarge ciphertext
+- Out-of-range PN jumps
+
+Zeroize:
+- SS
+- CK values
+- skS
+- Cached packet keys
+
+# 10. Guarantees Achieved
+
+- Per-packet key separation
+- Forward secrecy across epochs
+- No standalone MAC oracle surface
+- Bounded memory usage
+- Deterministic epoch signaling
+- Maximum two-epoch key retention

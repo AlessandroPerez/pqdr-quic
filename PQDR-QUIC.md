@@ -10,7 +10,7 @@ PQDR-QUIC extends QUIC with post-quantum cryptography and advanced security prop
 - **Forward secrecy**: Each packet encrypted with a unique key derived via BLAKE3 KDF chain
 - **Post-compromise recovery**: Automatic ML-KEM ratchets every 60 seconds restore security after compromise
 - **Signal-style double ratchet**: Combines symmetric (BLAKE3 chain) and asymmetric (ML-KEM) ratchets
-- **Minimal overhead**: Only ~5-6% performance impact for 20GB transfers
+- **Minimal overhead**: Only ~2% performance impact for 20GB transfers
 
 ### Key Security Properties
 
@@ -45,14 +45,15 @@ Together, these properties provide **continuous security**: compromise of any si
 3. **Double-Ratchet State Machine** (`quiche/src/crypto/ratchet.rs`)
    - Complete ratchet state with symmetric and asymmetric ratchets
    - Timer-based ratchet initiation (every 60 seconds)
-   - Alternating client/server ratchet initiation
+   - Server-always-initiates ratchet model (`we_initiate_next = is_server`)
    - Out-of-order packet handling with skipped keys cache
-   - 4/4 active tests passing ✓
+   - Epoch-transition `recv_chain_pn` sync fix (Bug 4: in-flight packet misalignment)
+   - 8/8 tests passing ✓ (includes regression test for Bug 4)
 
-4. **KEY_RATCHET Frame** (`quiche/src/frame.rs`)
-   - New frame type 0x40 for ML-KEM key material exchange
-   - Encoding/decoding with epoch and key material
-   - Wire format complete
+4. **KEM Material Transport**
+   - Server ML-KEM pubkey: sent as 64-byte plaintext prefix embedded in first 19 application packets per epoch (assembled in-order by packet number)
+   - Client KEM ciphertext: sent as raw bytes via QUIC CRYPTO stream at t≈55s
+   - `KEY_RATCHET` frame type 0x40 exists in `frame.rs` but is deprecated and ignored; reception is silently dropped for backwards compatibility
 
 5. **Connection Integration** (`quiche/src/lib.rs`)
    - Ratchet state initialized after TLS handshake
@@ -108,7 +109,7 @@ Together, these properties provide **continuous security**: compromise of any si
 ```
 Time:  0s               60s              120s             180s
        │                │                │                │
-       │  Handshake     │  Client        │  Server        │  Client
+       │  Handshake     │  Server        │  Server        │  Server
        │  Complete      │  Initiates     │  Initiates     │  Initiates
        │                │  ML-KEM        │  ML-KEM        │  ML-KEM
        │                │  Ratchet       │  Ratchet       │  Ratchet
@@ -118,6 +119,8 @@ Time:  0s               60s              120s             180s
     ─────────────────────────────────────────────────────────>
                    Symmetric ratchet every packet
 ```
+
+Note: The server always initiates every ML-KEM ratchet. The client responds by encapsulating to the server's public key and sending the ciphertext via CRYPTO stream at t=55s of each epoch.
 
 ## File Structure
 
@@ -223,7 +226,7 @@ To revert to default cipher preference (AES-GCM prioritized), modify `quiche/dep
 
 Current test status:
 - BLAKE3 KDF: 5/5 tests passing ✓
-- Ratchet state: 4/4 active tests passing ✓
+- Ratchet state: 8/8 tests passing ✓ (includes `test_epoch_transition_inflight_pn_sync` regression for Bug 4)
 - ML-KEM serialization: 1 test ignored (needs CBS parsing)
 
 Run tests:
@@ -268,31 +271,28 @@ ls apps/src/bin/cert.crt apps/src/bin/cert.key
 - `--runs N`: Number of test runs per configuration (default: 1)
 - `--help`: Show usage information
 
-**Output**: Results are saved to `60s_ratchet.txt` with:
+**Output**: Results are saved to `sanity_check.txt` with:
 - Individual run results (download time, throughput, integrity check)
 - Aggregate statistics (mean, median, standard deviation, min, max, CV%)
 - Performance comparison (overhead percentage)
 
 #### Test Results
 
-Recent performance testing with 5 runs each (20GB file transfer):
+Performance testing with **10 runs each** (20GB file transfer, loopback):
 
 **Vanilla QUIC**:
-- Mean throughput: 2327.41 Mbps (CV: 1.00%)
-- Download time: 70.40s average
+- Mean throughput: **2351.75 Mbps** | Median: 2344.68 Mbps
+- StdDev: 34.48 Mbps | CV: 1.0%
+- Download time: 69.68s average (min: 67.89s, max: 71.39s)
 
 **PQDR-QUIC (60s ratchet)**:
-- Mean throughput: 2200.71 Mbps (CV: 1.00%)
-- Download time: 74.47s average
+- Mean throughput: **2304.77 Mbps** | Median: 2329.25 Mbps
+- StdDev: 46.23 Mbps | CV: 2.0%
+- Download time: 71.11s average (min: 69.53s, max: 73.34s)
 
-**Overhead: ~5.44%**
+**Overhead: ~2.0%** (≈ 1.4 seconds for 20GB)
 
-This overhead breaks down to approximately:
-- Per-packet BLAKE3 KDF: ~64ns (~26% of overhead)
-- Per-packet ChaCha20-Poly1305 context init/cleanup: ~186ns (~74% of overhead)
-- **Total per-packet overhead: ~250ns**
-
-For a 20GB transfer at 1200 bytes per packet (~17.5 million packets), this translates to only ~4.4 seconds of crypto overhead for post-quantum security with per-packet forward secrecy!
+All 20 runs passed integrity check (BLAKE3 hash match).
 
 ## Performance Considerations
 
@@ -307,9 +307,9 @@ Based on extensive testing with 20GB file transfers:
 - **Total per-packet overhead**: ~250ns
 
 **End-to-end performance**:
-- Vanilla QUIC: ~2327 Mbps average throughput
-- PQDR-QUIC: ~2201 Mbps average throughput
-- **Overhead: 5-6%** for bulk data transfer
+- Vanilla QUIC: ~2352 Mbps mean throughput (median 2345 Mbps)
+- PQDR-QUIC: ~2305 Mbps mean throughput (median 2329 Mbps)
+- **Overhead: ~2%** for bulk data transfer
 
 **Memory usage**:
 - Ratchet state: ~3KB per connection
@@ -341,7 +341,7 @@ Effective data per packet: ~1161 bytes (96.7% efficiency)
 **PQDR vs Vanilla packet processing**:
 - Vanilla: Reuses AEAD context for all packets (~50ns encryption overhead)
 - PQDR: Fresh AEAD context + BLAKE3 derivation per packet (~250ns overhead)
-- **5x slowdown per packet, but only 5-6% end-to-end** (crypto is small fraction of total time)
+- **5x slowdown per packet, but only ~2% end-to-end** (crypto is small fraction of total time)
 
 ### Why PQDR is Efficient
 
@@ -409,10 +409,11 @@ This matches the security model of secure messaging apps like Signal, applied to
 - [x] ML-KEM-768 integration
 - [x] BLAKE3 KDF integration
 - [x] Packet encryption/decryption with per-packet rekeying
-- [x] Performance optimization (achieved 5-6% overhead)
-- [x] Comprehensive performance testing framework
-- [x] Statistical analysis of performance results
+- [x] Performance optimization (achieved ~2% overhead)
+- [x] Comprehensive performance testing framework (10-run statistical analysis)
 - [x] ChaCha20-Poly1305 cipher standardization (fair comparison)
+- [x] Bug 4 fix: epoch-transition `recv_chain_pn` sync for in-flight packets
+- [x] Regression test suite (`test_epoch_transition_inflight_pn_sync`)
 
 ### In Progress / Future Enhancements
 
@@ -439,11 +440,11 @@ This matches the security model of secure messaging apps like Signal, applied to
 | **KDF Algorithm** | BLAKE3 | ~10GB/s single-threaded |
 | **AEAD Cipher** | ChaCha20-Poly1305 | Zero key schedule cost |
 | **Key Size** | 32 bytes (256 bits) | Per-packet encryption key |
-| **Nonce Size** | 12 bytes (96 bits) | Packet counter-based |
+| **Nonce** | 12 bytes (96 bits), always zero | Key rotates every packet so (key, nonce=0) is always a fresh pair |
 | **AEAD Tag** | 16 bytes (128 bits) | Authentication tag |
 | **UDP Datagram** | 1200 bytes | Minimum MTU size |
 | **Effective Payload** | ~1161 bytes | 96.7% efficiency |
-| **Overhead** | 5-6% | End-to-end bulk transfer |
+| **Overhead** | ~2% | End-to-end bulk transfer (10-run avg) |
 | **Per-packet Cost** | ~250ns | BLAKE3 + AEAD context |
 | **Per-ratchet Cost** | ~50μs | ML-KEM encapsulation |
 | **Memory/Connection** | ~3KB | Ratchet state |
