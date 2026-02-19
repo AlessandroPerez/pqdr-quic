@@ -39,7 +39,6 @@ dd if=/dev/urandom of=test-www/test_20gb.bin bs=1M count=20480
 | Per-Packet Keys | ❌ TLS session key | ✅ BLAKE3 ratchet |
 | Compromise Recovery | ❌ None | ✅ 60s ML-KEM ratchet |
 | Performance | 2352 Mbps | 2305 Mbps (-2.0%) |
-| Cipher | AES-GCM (default) | ChaCha20-Poly1305 |
 
 ### Performance Results
 
