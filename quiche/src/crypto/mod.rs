@@ -627,6 +627,7 @@ pub fn pqdr_seal(
     nonce[4..].copy_from_slice(&counter.to_be_bytes());
 
     // Encrypt in-place
+    // Note: buf may contain [KEM_chunk||payload] - both get encrypted
     let mut out_len = 0usize;
     let max_out_len = in_len + 16; // plaintext + tag
 
@@ -658,6 +659,7 @@ pub fn pqdr_seal(
 /// Fast PQDR decryption using BoringSSL ChaCha20-Poly1305.
 pub fn pqdr_open(
     key: &[u8; 32], counter: u64, ad: &[u8], buf: &mut [u8],
+    extra_in: Option<&[u8]>,
 ) -> Result<usize> {
     use std::mem::MaybeUninit;
     use std::ptr;
@@ -689,6 +691,20 @@ pub fn pqdr_open(
     let mut nonce = [0u8; 12];
     nonce[4..].copy_from_slice(&counter.to_be_bytes());
 
+    // Construct full AD: header + optional extra (KEM chunk)
+    let full_ad: Vec<u8>;
+    let ad_ptr: *const u8;
+    let ad_len: usize;
+
+    if let Some(extra) = extra_in {
+        full_ad = [ad, extra].concat();
+        ad_ptr = full_ad.as_ptr();
+        ad_len = full_ad.len();
+    } else {
+        ad_ptr = ad.as_ptr();
+        ad_len = ad.len();
+    }
+
     // Decrypt in-place
     let mut out_len = 0usize;
 
@@ -702,8 +718,8 @@ pub fn pqdr_open(
             12,
             buf.as_ptr(),
             buf.len(),
-            ad.as_ptr(),
-            ad.len(),
+            ad_ptr,
+            ad_len,
         )
     };
 

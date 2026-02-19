@@ -695,11 +695,13 @@ pub fn decrypt_pkt_pqdr_fast<'a>(
     let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
 
     // Decrypt directly with ratchet key (counter=0 since key is single-use)
+    // TODO: Extract and use KEM chunk from packet for AD matching
     let payload_len = crypto::pqdr_open(
         ratchet_key,
         0,  // Counter always 0 - each ratchet key used once
         header.as_ref(),
         ciphertext.as_mut(),
+        None,  // TODO: KEM chunk extraction for AD
     )?;
 
     Ok(b.get_bytes(payload_len)?)
@@ -790,17 +792,49 @@ pub fn encrypt_pkt_pqdr_fast(
     b: &mut octets::OctetsMut, pn: u64, ratchet_key: &[u8; 32], pn_len: usize,
     payload_len: usize, payload_offset: usize,
     hp_aead: &crypto::Seal,
+    kem_chunk: Option<&[u8]>,
 ) -> Result<usize> {
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
-    // Encrypt payload directly with ratchet key (counter=0 since key is single-use)
-    let ciphertext_len = crypto::pqdr_seal(
-        ratchet_key,
-        0,  // Counter always 0 - each ratchet key used once
-        header.as_ref(),
-        payload.as_mut(),
-        payload_len,
-    )?;
+    // Encrypt payload (with optional KEM chunk prepended)
+    let ciphertext_len = if let Some(chunk) = kem_chunk {
+        // Chunk must be 64 bytes
+        if chunk.len() != 64 {
+            return Err(Error::InvalidPacket);
+        }
+
+        // Create temp buffer: [chunk || payload || space for tag]
+        let plaintext_len = 64 + payload_len;
+        let mut temp_buf = vec![0u8; plaintext_len + 16]; // +16 for Poly1305 tag
+
+        // Copy chunk
+        temp_buf[..64].copy_from_slice(chunk);
+        // Copy existing payload data
+        temp_buf[64..plaintext_len].copy_from_slice(&payload.as_ref()[..payload_len]);
+
+        // Encrypt in temp buffer
+        let ct_len = crypto::pqdr_seal(
+            ratchet_key,
+            0,  // Counter always 0 - each ratchet key used once
+            header.as_ref(),
+            &mut temp_buf,
+            plaintext_len,
+        )?;
+
+        // Copy ciphertext back to original buffer
+        payload.as_mut()[..ct_len].copy_from_slice(&temp_buf[..ct_len]);
+
+        ct_len
+    } else {
+        // No chunk, encrypt payload normally
+        crypto::pqdr_seal(
+            ratchet_key,
+            0,
+            header.as_ref(),
+            payload.as_mut(),
+            payload_len,
+        )?
+    };
 
     // Protect header with the stable TLS-derived key
     encrypt_hdr(&mut header, pn_len, payload.as_ref(), hp_aead)?;

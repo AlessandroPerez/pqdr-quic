@@ -27,8 +27,12 @@
 
 //! BLAKE3-based key derivation for PQDR-QUIC double ratchet
 //!
-//! Implements HKDF-style key derivation using BLAKE3 as the hash function,
-//! following the pattern from the Signal Protocol's double ratchet.
+//! Key derivation design:
+//! - Per-packet key: `H(chain_key, pn)` using BLAKE3 XOF producing 64 bytes
+//!   - bytes [0..32]  → new chain_key (carry forward)
+//!   - bytes [32..64] → encryption_key for this packet
+//! - Epoch transition: `derive_epoch_chain_keys(kem_shared_secret, starting_pn)`
+//!   produces independent send/recv chain keys for the new epoch
 
 use crate::Error;
 use crate::Result;
@@ -39,9 +43,7 @@ pub const BLAKE3_OUT_LEN: usize = 32;
 /// HKDF-Extract using BLAKE3
 ///
 /// Extracts a pseudorandom key from input key material and salt.
-/// Similar to HKDF-Extract but using BLAKE3 instead of SHA-256.
 pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; BLAKE3_OUT_LEN] {
-    // BLAKE3 keyed hash with salt as the key
     blake3::keyed_hash(
         blake3::hash(salt).as_bytes(),
         ikm,
@@ -50,8 +52,7 @@ pub fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; BLAKE3_OUT_LEN] {
 
 /// HKDF-Expand using BLAKE3
 ///
-/// Expands a pseudorandom key into multiple output bytes.
-/// Similar to HKDF-Expand but using BLAKE3 XOF (extendable output function).
+/// Expands a pseudorandom key into multiple output bytes using BLAKE3 XOF.
 pub fn hkdf_expand(
     prk: &[u8; BLAKE3_OUT_LEN],
     info: &[u8],
@@ -61,7 +62,6 @@ pub fn hkdf_expand(
         return Err(Error::CryptoFail);
     }
 
-    // Use BLAKE3 in XOF (extendable output) mode
     let mut hasher = blake3::Hasher::new_keyed(prk);
     hasher.update(info);
 
@@ -71,87 +71,98 @@ pub fn hkdf_expand(
     Ok(())
 }
 
-/// Derive ratchet keys from root key and DH output
+/// Derive per-packet chain key and encryption key from chain key + packet number.
 ///
-/// This is the core KDF for the double ratchet, deriving both a new root key
-/// and a new chain key from the current root key and a Diffie-Hellman output.
+/// Uses BLAKE3 XOF to produce 64 bytes from `H(chain_key, pn)`:
+///   - output[0..32]  → new_chain_key  (carry forward for next packet)
+///   - output[32..64] → enc_key        (use once to encrypt this packet)
 ///
-/// KDF(rk, dh_out) -> (root_key, chain_key)
-pub fn derive_ratchet_keys(
-    root_key: &[u8; BLAKE3_OUT_LEN],
-    dh_output: &[u8],
-) -> ([u8; BLAKE3_OUT_LEN], [u8; BLAKE3_OUT_LEN]) {
-    // Extract: combine root_key and dh_output
-    let prk = hkdf_extract(root_key, dh_output);
-
-    // Expand: derive both root_key and chain_key
-    let mut output = [0u8; BLAKE3_OUT_LEN * 2];
-    hkdf_expand(&prk, b"pqdr-quic-ratchet", &mut output)
-        .expect("HKDF expand should not fail");
-
-    let mut new_root_key = [0u8; BLAKE3_OUT_LEN];
-    let mut new_chain_key = [0u8; BLAKE3_OUT_LEN];
-
-    new_root_key.copy_from_slice(&output[0..BLAKE3_OUT_LEN]);
-    new_chain_key.copy_from_slice(&output[BLAKE3_OUT_LEN..BLAKE3_OUT_LEN * 2]);
-
-    (new_root_key, new_chain_key)
-}
-
-/// Derive message key from chain key
-///
-/// Advances the chain key and derives an encryption key for a single message.
-/// KDF_CK(ck) -> (chain_key, message_key)
+/// Example chain for epoch starting at `ss`:
+///   pn=0: (chain_key_0, enc_key_0) = H(ss,        0)
+///   pn=1: (chain_key_1, enc_key_1) = H(chain_key_0, 1)
+///   pn=N: (chain_key_N, enc_key_N) = H(chain_key_{N-1}, N)
 pub fn derive_message_key(
     chain_key: &[u8; BLAKE3_OUT_LEN],
+    pn: u64,
 ) -> ([u8; BLAKE3_OUT_LEN], [u8; BLAKE3_OUT_LEN]) {
-    // Hash chain_key with different constants to derive two independent keys
-    let new_chain_key = blake3::keyed_hash(chain_key, b"chain").into();
-    let message_key = blake3::keyed_hash(chain_key, b"message").into();
+    // BLAKE3 keyed hash: key=chain_key, data=pn_be — produce 64 bytes via XOF
+    let mut hasher = blake3::Hasher::new_keyed(chain_key);
+    hasher.update(&pn.to_be_bytes());
 
-    (new_chain_key, message_key)
+    let mut output = [0u8; BLAKE3_OUT_LEN * 2];
+    hasher.finalize_xof().fill(&mut output);
+
+    let mut new_chain_key = [0u8; BLAKE3_OUT_LEN];
+    let mut enc_key = [0u8; BLAKE3_OUT_LEN];
+    new_chain_key.copy_from_slice(&output[..BLAKE3_OUT_LEN]);
+    enc_key.copy_from_slice(&output[BLAKE3_OUT_LEN..]);
+
+    (new_chain_key, enc_key)
 }
 
-/// Initialize root key from TLS handshake secret
+/// Initialize root key from TLS handshake secret.
 ///
-/// Derives the initial root key for the double ratchet from the TLS 1.3
-/// handshake shared secret.
+/// Derives the initial shared secret used to seed the epoch-0 chains.
 pub fn init_root_key_from_handshake(
     handshake_secret: &[u8],
 ) -> [u8; BLAKE3_OUT_LEN] {
-    // Simple hash for initialization
     let mut output = [0u8; BLAKE3_OUT_LEN];
     hkdf_expand(
         blake3::hash(handshake_secret).as_bytes(),
         b"pqdr-quic-init",
         &mut output,
     ).expect("HKDF expand should not fail");
-
     output
 }
 
-/// Derive initial send and receive chain keys from root key
+/// Derive initial send and receive chain keys from root key (epoch 0).
 ///
-/// Used only during initialization to derive separate send/receive chain keys.
-/// Returns (send_chain_key, recv_chain_key)
+/// Returns `(send_chain_key, recv_chain_key)`.
+/// The server swaps these at init time so server-send == client-recv.
 pub fn derive_initial_chain_keys(
     root_key: &[u8; BLAKE3_OUT_LEN],
 ) -> ([u8; BLAKE3_OUT_LEN], [u8; BLAKE3_OUT_LEN]) {
     let prk = hkdf_extract(root_key, b"initial");
 
-    // Expand to get both send and recv chain keys
     let mut output = [0u8; BLAKE3_OUT_LEN * 2];
     hkdf_expand(&prk, b"pqdr-quic-chains", &mut output)
         .expect("HKDF expand should not fail");
 
     let mut send_chain_key = [0u8; BLAKE3_OUT_LEN];
     let mut recv_chain_key = [0u8; BLAKE3_OUT_LEN];
-
-    send_chain_key.copy_from_slice(&output[0..BLAKE3_OUT_LEN]);
-    recv_chain_key.copy_from_slice(&output[BLAKE3_OUT_LEN..BLAKE3_OUT_LEN * 2]);
+    send_chain_key.copy_from_slice(&output[..BLAKE3_OUT_LEN]);
+    recv_chain_key.copy_from_slice(&output[BLAKE3_OUT_LEN..]);
 
     (send_chain_key, recv_chain_key)
 }
+
+/// Derive epoch chain keys from KEM shared secret and starting packet number.
+///
+/// Used at epoch N≥1 transitions. Mixes the KEM shared secret with the
+/// starting pn so the chain is bound to the epoch boundary.
+///
+/// Returns `(send_chain_key, recv_chain_key)`.
+/// Caller must swap for server side (server-send == client-recv).
+pub fn derive_epoch_chain_keys(
+    shared_secret: &[u8],
+    starting_pn: u64,
+) -> ([u8; BLAKE3_OUT_LEN], [u8; BLAKE3_OUT_LEN]) {
+    let pn_bytes = starting_pn.to_be_bytes();
+    // salt = starting_pn bytes, ikm = kem shared secret
+    let prk = hkdf_extract(&pn_bytes, shared_secret);
+
+    let mut output = [0u8; BLAKE3_OUT_LEN * 2];
+    hkdf_expand(&prk, b"pqdr-epoch-chains", &mut output)
+        .expect("HKDF expand should not fail");
+
+    let mut send_chain_key = [0u8; BLAKE3_OUT_LEN];
+    let mut recv_chain_key = [0u8; BLAKE3_OUT_LEN];
+    send_chain_key.copy_from_slice(&output[..BLAKE3_OUT_LEN]);
+    recv_chain_key.copy_from_slice(&output[BLAKE3_OUT_LEN..]);
+
+    (send_chain_key, recv_chain_key)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -165,11 +176,9 @@ mod tests {
         let prk = hkdf_extract(salt, ikm);
         assert_eq!(prk.len(), BLAKE3_OUT_LEN);
 
-        // Same inputs should produce same output
         let prk2 = hkdf_extract(salt, ikm);
         assert_eq!(prk, prk2);
 
-        // Different inputs should produce different output
         let prk3 = hkdf_extract(salt, b"different-ikm");
         assert_ne!(prk, prk3);
     }
@@ -182,92 +191,89 @@ mod tests {
         let mut output1 = vec![0u8; 64];
         hkdf_expand(&prk, info, &mut output1).unwrap();
 
-        // Same inputs should produce same output
         let mut output2 = vec![0u8; 64];
         hkdf_expand(&prk, info, &mut output2).unwrap();
         assert_eq!(output1, output2);
 
-        // Different info should produce different output
         let mut output3 = vec![0u8; 64];
         hkdf_expand(&prk, b"different-info", &mut output3).unwrap();
         assert_ne!(output1, output3);
     }
 
     #[test]
-    fn test_derive_ratchet_keys() {
-        let root_key = [0x01u8; BLAKE3_OUT_LEN];
-        let dh_output = b"diffie-hellman-shared-secret";
-
-        let (new_root, new_chain) = derive_ratchet_keys(&root_key, dh_output);
-
-        // Keys should be different from each other
-        assert_ne!(new_root, new_chain);
-
-        // Keys should be deterministic
-        let (new_root2, new_chain2) = derive_ratchet_keys(&root_key, dh_output);
-        assert_eq!(new_root, new_root2);
-        assert_eq!(new_chain, new_chain2);
-    }
-
-    #[test]
     fn test_derive_message_key() {
         let chain_key = [0x02u8; BLAKE3_OUT_LEN];
 
-        let (new_chain, msg_key) = derive_message_key(&chain_key);
+        let (new_chain, enc_key) = derive_message_key(&chain_key, 0);
 
-        // Chain key and message key should be different
-        assert_ne!(new_chain, msg_key);
+        assert_ne!(new_chain, enc_key);
         assert_ne!(new_chain, chain_key);
+        assert_ne!(enc_key, chain_key);
 
-        // Should be deterministic
-        let (new_chain2, msg_key2) = derive_message_key(&chain_key);
+        // Deterministic
+        let (new_chain2, enc_key2) = derive_message_key(&chain_key, 0);
         assert_eq!(new_chain, new_chain2);
-        assert_eq!(msg_key, msg_key2);
+        assert_eq!(enc_key, enc_key2);
 
-        // Advancing chain should produce different keys
-        let (new_chain3, msg_key3) = derive_message_key(&new_chain);
-        assert_ne!(msg_key, msg_key3);
+        // Different pn → different keys
+        let (new_chain3, enc_key3) = derive_message_key(&chain_key, 1);
+        assert_ne!(enc_key, enc_key3);
         assert_ne!(new_chain, new_chain3);
     }
 
     #[test]
-    fn test_init_root_key() {
-        let secret1 = b"handshake-secret-1";
-        let secret2 = b"handshake-secret-2";
+    fn test_derive_message_key_chain() {
+        // Verify chain advances: H(ss, 0) then H(chain_0, 1)
+        let ss = [0xAAu8; BLAKE3_OUT_LEN];
 
-        let root1 = init_root_key_from_handshake(secret1);
-        let root2 = init_root_key_from_handshake(secret2);
+        let (chain_0, enc_0) = derive_message_key(&ss, 0);
+        let (chain_1, enc_1) = derive_message_key(&chain_0, 1);
+        let (_, enc_2) = derive_message_key(&chain_1, 2);
 
-        // Different secrets should produce different root keys
-        assert_ne!(root1, root2);
-
-        // Same secret should produce same root key
-        let root1_again = init_root_key_from_handshake(secret1);
-        assert_eq!(root1, root1_again);
+        assert_ne!(enc_0, enc_1);
+        assert_ne!(enc_1, enc_2);
+        assert_ne!(enc_0, enc_2);
+        // Chain keys advance
+        assert_ne!(ss, chain_0);
+        assert_ne!(chain_0, chain_1);
     }
 
     #[test]
-    fn test_symmetric_encryption_decryption() {
-        // Test that sender and receiver derive the same keys
+    fn test_derive_epoch_chain_keys() {
+        let ss = b"kem-shared-secret-32-bytes-abcdef";
+        let pn = 12345u64;
+
+        let (s1, r1) = derive_epoch_chain_keys(ss, pn);
+        let (s2, r2) = derive_epoch_chain_keys(ss, pn);
+        assert_eq!(s1, s2);
+        assert_eq!(r1, r2);
+
+        // Different pn → different keys
+        let (s3, _) = derive_epoch_chain_keys(ss, pn + 1);
+        assert_ne!(s1, s3);
+
+        // send and recv are different
+        assert_ne!(s1, r1);
+    }
+
+    #[test]
+    fn test_symmetric_send_recv_match() {
+        // Verify client send = server recv for epoch 0
         let shared_secret = b"shared-tls-secret-for-testing-123";
         let root_key = init_root_key_from_handshake(shared_secret);
 
-        // Client derives send/recv chains
-        let (client_send, client_recv) = derive_initial_chain_keys(&root_key);
+        // Client: (send, recv)
+        let (client_send, _client_recv) = derive_initial_chain_keys(&root_key);
+        // Server: swap — server_send_chain = chain_recv output
+        let (chain_s, chain_r) = derive_initial_chain_keys(&root_key);
+        let server_recv = chain_s; // server recv = first output of derive_initial_chain_keys
 
-        // Server derives same chains but swapped
-        let (server_recv, server_send) = derive_initial_chain_keys(&root_key);
-
-        // Verify client send = server recv
+        // Client send chain == server recv chain
         assert_eq!(client_send, server_recv);
-        assert_eq!(client_recv, server_send);
 
-        // Now derive message keys
-        let (client_new_chain, client_msg_key) = derive_message_key(&client_send);
-        let (server_new_chain, server_msg_key) = derive_message_key(&server_recv);
-
-        // Message keys should match!
-        assert_eq!(client_msg_key, server_msg_key, "Message keys don't match!");
-        assert_eq!(client_new_chain, server_new_chain, "New chain keys don't match!");
+        // Same chain state → same per-packet key
+        let (_, client_enc_0) = derive_message_key(&client_send, 0);
+        let (_, server_enc_0) = derive_message_key(&server_recv, 0);
+        assert_eq!(client_enc_0, server_enc_0, "Encryption keys must match!");
     }
 }

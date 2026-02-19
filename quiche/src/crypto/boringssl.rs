@@ -43,8 +43,33 @@ pub struct MLKEM768_private_key {
 // ML-KEM-768 constants
 pub const MLKEM768_PUBLIC_KEY_BYTES: usize = 1184;
 pub const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
+
+// ML-KEM-512 opaque types (must match BoringSSL structs)
+#[repr(C)]
+pub struct MLKEM512_public_key {
+    opaque: [u8; 256 * (3 + 9) + 32 + 32],
+}
+
+#[repr(C)]
+pub struct MLKEM512_private_key {
+    opaque: [u8; 256 * (3 + 3 + 9) + 32 + 32 + 32],
+}
+
+// ML-KEM-512 constants
+pub const MLKEM512_PUBLIC_KEY_BYTES: usize = 800;
+pub const MLKEM512_CIPHERTEXT_BYTES: usize = 768;
+
+// Common ML-KEM constants
 pub const MLKEM_SHARED_SECRET_BYTES: usize = 32;
 pub const MLKEM_SEED_BYTES: usize = 64;
+
+// BoringSSL CBS (CRYPTO ByteString) — used for MLKEM parse functions.
+// Must match the cbs_st layout in <openssl/bytestring.h>: { data: *const u8, len: usize }
+#[repr(C)]
+struct CBS {
+    data: *const u8,
+    len: usize,
+}
 
 impl Algorithm {
     fn get_evp_aead(self) -> *const EVP_AEAD {
@@ -453,6 +478,42 @@ extern "C" {
         out_public_key: *mut MLKEM768_public_key,
         private_key: *const MLKEM768_private_key,
     );
+
+    // ML-KEM-512
+    fn MLKEM512_generate_key(
+        out_encoded_public_key: *mut u8,
+        optional_out_seed: *mut u8,
+        out_private_key: *mut MLKEM512_private_key,
+    );
+
+    fn MLKEM512_encap(
+        out_ciphertext: *mut u8,
+        out_shared_secret: *mut u8,
+        public_key: *const MLKEM512_public_key,
+    );
+
+    fn MLKEM512_decap(
+        out_shared_secret: *mut u8,
+        ciphertext: *const u8,
+        ciphertext_len: usize,
+        private_key: *const MLKEM512_private_key,
+    ) -> c_int;
+
+    fn MLKEM512_public_from_private(
+        out_public_key: *mut MLKEM512_public_key,
+        private_key: *const MLKEM512_private_key,
+    );
+
+    // BoringSSL CBS (CRYPTO ByteString) — needed for *_parse_public_key
+    fn MLKEM768_parse_public_key(
+        out_public_key: *mut MLKEM768_public_key,
+        cbs: *mut CBS,
+    ) -> c_int;
+
+    fn MLKEM512_parse_public_key(
+        out_public_key: *mut MLKEM512_public_key,
+        cbs: *mut CBS,
+    ) -> c_int;
 }
 
 // ML-KEM-768 Rust API wrappers
@@ -465,7 +526,18 @@ impl MLKEM768_public_key {
         let mut key = MLKEM768_public_key {
             opaque: [0; 512 * (3 + 9) + 32 + 32],
         };
-        key.opaque.copy_from_slice(bytes);
+        // CBS_init is inline in BoringSSL headers, so initialize the struct directly.
+        // Layout matches cbs_st: { data: *const u8, len: usize }
+        let mut cbs = CBS {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let rc = unsafe {
+            MLKEM768_parse_public_key(&mut key as *mut _, &mut cbs)
+        };
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
         Ok(key)
     }
 
@@ -505,31 +577,22 @@ impl MLKEM768_private_key {
     pub fn encapsulate_to_bytes(
         encoded_pubkey: &[u8],
     ) -> Result<([u8; MLKEM_SHARED_SECRET_BYTES], Vec<u8>)> {
-        if encoded_pubkey.len() != MLKEM768_PUBLIC_KEY_BYTES {
-            return Err(Error::CryptoFail);
-        }
+        // Parse the encoded public key into the proper expanded struct layout.
+        // MLKEM768_encap requires the decoded/NTT-expanded form, NOT the raw bytes.
+        let public_key = MLKEM768_public_key::from_bytes(encoded_pubkey)?;
+
+        let mut ciphertext = vec![0u8; MLKEM768_CIPHERTEXT_BYTES];
+        let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
 
         unsafe {
-            // Create public key structure from encoded bytes
-            // The opaque structure starts with the encoded form
-            let mut public_key: MLKEM768_public_key = std::mem::zeroed();
-            std::ptr::copy_nonoverlapping(
-                encoded_pubkey.as_ptr(),
-                public_key.opaque.as_mut_ptr(),
-                MLKEM768_PUBLIC_KEY_BYTES,
-            );
-
-            let mut ciphertext = vec![0u8; MLKEM768_CIPHERTEXT_BYTES];
-            let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
-
             MLKEM768_encap(
                 ciphertext.as_mut_ptr(),
                 shared_secret.as_mut_ptr(),
                 &public_key as *const _,
             );
-
-            Ok((shared_secret, ciphertext))
         }
+
+        Ok((shared_secret, ciphertext))
     }
 
     /// Decapsulate: extract shared secret from ciphertext
@@ -542,6 +605,110 @@ impl MLKEM768_private_key {
 
         let rc = unsafe {
             MLKEM768_decap(
+                shared_secret.as_mut_ptr(),
+                ciphertext.as_ptr(),
+                ciphertext.len(),
+                self as *const _,
+            )
+        };
+
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+
+        Ok(shared_secret)
+    }
+}
+
+// ML-KEM-512 Rust API wrappers
+impl MLKEM512_public_key {
+    /// Parse a public key from its encoded form
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != MLKEM512_PUBLIC_KEY_BYTES {
+            return Err(Error::CryptoFail);
+        }
+        let mut key = MLKEM512_public_key {
+            opaque: [0; 256 * (3 + 9) + 32 + 32],
+        };
+        // CBS_init is inline in BoringSSL headers, so initialize the struct directly.
+        // Layout matches cbs_st: { data: *const u8, len: usize }
+        let mut cbs = CBS {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let rc = unsafe {
+            MLKEM512_parse_public_key(&mut key as *mut _, &mut cbs)
+        };
+        if rc != 1 {
+            return Err(Error::CryptoFail);
+        }
+        Ok(key)
+    }
+
+    /// Encode the public key to bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.opaque[..MLKEM512_PUBLIC_KEY_BYTES].to_vec()
+    }
+}
+
+impl MLKEM512_private_key {
+    /// Generate a new ML-KEM512 keypair
+    pub fn generate() -> (Self, Vec<u8>) {
+        let mut private_key = std::mem::MaybeUninit::uninit();
+        let mut encoded_public_key = vec![0u8; MLKEM512_PUBLIC_KEY_BYTES];
+
+        unsafe {
+            MLKEM512_generate_key(
+                encoded_public_key.as_mut_ptr(),
+                std::ptr::null_mut(), // No seed output needed
+                private_key.as_mut_ptr(),
+            );
+            (private_key.assume_init(), encoded_public_key)
+        }
+    }
+
+    /// Get the public key corresponding to this private key
+    pub fn public_key(&self) -> MLKEM512_public_key {
+        let mut public_key = std::mem::MaybeUninit::uninit();
+        unsafe {
+            MLKEM512_public_from_private(public_key.as_mut_ptr(), self as *const _);
+            public_key.assume_init()
+        }
+    }
+
+    /// Encapsulate to encoded public key bytes
+    /// Returns (shared_secret, ciphertext)
+    pub fn encapsulate_to_bytes(
+        encoded_pubkey: &[u8],
+    ) -> Result<([u8; MLKEM_SHARED_SECRET_BYTES], Vec<u8>)> {
+        // Parse the encoded public key into the proper expanded struct layout.
+        // MLKEM512_encap requires the decoded/NTT-expanded form, NOT the raw bytes.
+        let public_key = MLKEM512_public_key::from_bytes(encoded_pubkey)?;
+
+        let mut ciphertext = vec![0u8; MLKEM512_CIPHERTEXT_BYTES];
+        let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
+
+        unsafe {
+            MLKEM512_encap(
+                ciphertext.as_mut_ptr(),
+                shared_secret.as_mut_ptr(),
+                &public_key as *const _,
+            );
+        }
+
+        Ok((shared_secret, ciphertext))
+    }
+
+    /// Decapsulate: extract shared secret from ciphertext
+    pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; MLKEM_SHARED_SECRET_BYTES]> {
+        if ciphertext.len() != MLKEM512_CIPHERTEXT_BYTES {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut shared_secret = [0u8; MLKEM_SHARED_SECRET_BYTES];
+
+        let rc = unsafe {
+            MLKEM512_decap(
                 shared_secret.as_mut_ptr(),
                 ciphertext.as_ptr(),
                 ciphertext.len(),

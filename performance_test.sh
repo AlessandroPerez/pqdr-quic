@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 FILE="test_20gb.bin"
 SERVER_FILE="test-www/$FILE"
 CLIENT_FILE="/tmp/quic_download_$FILE"
-RESULTS_FILE="60s_ratchet.txt"
+RESULTS_FILE="sanity_check.txt"
 
 # Default number of runs
 RUNS=1
@@ -140,7 +140,7 @@ run_test() {
     # Clean up previous download
     rm -f "$CLIENT_FILE"
 
-    # Start server
+    # Start server (idle-timeout set to 300s = 5 minutes for large file transfers)
     echo -e "${BLUE}Starting server...${NC}" >&2
     if [ "$pqdr_enabled" = "true" ]; then
         ./target/release/quiche-server \
@@ -149,7 +149,8 @@ run_test() {
             --key apps/src/bin/cert.key \
             --root test-www \
             --max-data 25000000000 \
-            --max-stream-data 25000000000 > /tmp/server_perf.log 2>&1 &
+            --max-stream-data 25000000000 \
+            --idle-timeout 300000 > /tmp/server_perf.log 2>&1 &
     else
         ./target/release/quiche-server \
             --listen 127.0.0.1:4433 \
@@ -158,6 +159,7 @@ run_test() {
             --root test-www \
             --max-data 25000000000 \
             --max-stream-data 25000000000 \
+            --idle-timeout 300000 \
             --disable-pqdr > /tmp/server_perf.log 2>&1 &
     fi
     SERVER_PID=$!
@@ -175,18 +177,20 @@ run_test() {
     # Measure total time including download and hash verification
     START_TIME=$(date +%s.%N)
 
-    # Download file
+    # Download file (with 5-minute idle timeout for large files)
     if [ "$pqdr_enabled" = "true" ]; then
         ./target/release/quiche-client \
             --no-verify \
             --max-data 25000000000 \
             --max-stream-data 25000000000 \
+            --idle-timeout 300000 \
             https://127.0.0.1:4433/$FILE > "$CLIENT_FILE" 2>/dev/null
     else
         ./target/release/quiche-client \
             --no-verify \
             --max-data 25000000000 \
             --max-stream-data 25000000000 \
+            --idle-timeout 300000 \
             --disable-pqdr \
             https://127.0.0.1:4433/$FILE > "$CLIENT_FILE" 2>/dev/null
     fi
