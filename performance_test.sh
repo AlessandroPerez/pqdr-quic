@@ -6,10 +6,8 @@ set -e
 
 cd "$(dirname "$0")"
 
-FILE="test_20gb.bin"
-SERVER_FILE="test-www/$FILE"
-CLIENT_FILE="/tmp/quic_download_$FILE"
-RESULTS_FILE="sanity_check.txt"
+# Default file size in GB
+FILE_SIZE_GB=20
 
 # Default number of runs
 RUNS=1
@@ -21,9 +19,14 @@ while [[ $# -gt 0 ]]; do
             RUNS="$2"
             shift 2
             ;;
+        --size)
+            FILE_SIZE_GB="$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 [--runs N]"
+            echo "Usage: $0 [--runs N] [--size SIZE]"
             echo "  --runs N    Number of test runs per configuration (default: 1)"
+            echo "  --size SIZE File size in GB (default: 20)"
             echo "  --help      Show this help message"
             exit 0
             ;;
@@ -35,6 +38,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Update file name based on size
+FILE="test_${FILE_SIZE_GB}gb.bin"
+SERVER_FILE="test-www/$FILE"
+CLIENT_FILE="/tmp/quic_download_$FILE"
+RESULTS_FILE="performance_results.txt"
+
 # Colors for output
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -43,10 +52,17 @@ YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
 echo "=============================================="
-echo "QUIC Performance Test - 20GB File Transfer"
+echo "QUIC Performance Test - ${FILE_SIZE_GB}GB File Transfer"
 echo "Runs per configuration: $RUNS"
 echo "=============================================="
 echo ""
+
+# Ensure the test file exists, or create it if missing
+if [ ! -f "$SERVER_FILE" ]; then
+    echo -e "${YELLOW}Creating $SERVER_FILE (${FILE_SIZE_GB}GB)...${NC}"
+    mkdir -p "$(dirname "$SERVER_FILE")"
+    dd if=/dev/urandom of="$SERVER_FILE" bs=1M count=$((FILE_SIZE_GB * 1024))
+fi
 
 # Check if file exists
 if [ ! -f "$SERVER_FILE" ]; then
@@ -171,7 +187,7 @@ run_test() {
         return 1
     fi
 
-    echo -e "${BLUE}Downloading 20GB file...${NC}" >&2
+    echo -e "${BLUE}Downloading ${FILE_SIZE_GB}GB file...${NC}" >&2
     echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')" >&2
 
     # Measure total time including download and hash verification
@@ -221,7 +237,7 @@ run_test() {
     HASH_TIME=$(echo "$HASH_END - $DOWNLOAD_END" | bc)
 
     # Calculate throughput (20GB in bytes / time in seconds = bytes/sec, convert to Mbps)
-    THROUGHPUT=$(echo "scale=2; (20 * 1024 * 8) / $DOWNLOAD_TIME" | bc)
+    THROUGHPUT=$(echo "scale=2; (${FILE_SIZE_GB} * 1024 * 8) / $DOWNLOAD_TIME" | bc)
 
     # Verify integrity
     if [ "$SERVER_HASH" = "$CLIENT_HASH" ]; then

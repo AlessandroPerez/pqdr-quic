@@ -22,13 +22,14 @@ PQDR-QUIC extends QUIC with:
 
 ```bash
 # Clone and build
-git clone https://github.com/AlessandroPerez/pqdr-quic.git
+git clone --recurse-submodules https://github.com/AlessandroPerez/pqdr-quic.git
 cd pqdr-quic
-cargo build --release --bin quiche-server --bin quiche-client
 
-# Test PQDR vs Vanilla QUIC (requires 20GB test file)
-dd if=/dev/urandom of=test-www/test_20gb.bin bs=1M count=20480
-./performance_test.sh --runs 5
+# Build the Docker image
+docker build -t pqdr-quic-performance .
+
+# Run the performance test in Docker
+docker run --rm pqdr-quic-performance --runs 5 --size 20
 ```
 
 ## Key Differences from Standard quiche
