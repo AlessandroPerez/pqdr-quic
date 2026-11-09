@@ -655,13 +655,6 @@ pub fn decrypt_pkt<'a>(
     b: &'a mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     aead: &crypto::Open,
 ) -> Result<octets::Octets<'a>> {
-    decrypt_pkt_with_counter(b, pn, pn, pn_len, payload_len, aead)
-}
-
-pub fn decrypt_pkt_with_counter<'a>(
-    b: &'a mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
-    aead: &crypto::Open,
-) -> Result<octets::Octets<'a>> {
     let payload_offset = b.off();
 
     let (header, mut payload) = b.split_at(payload_offset)?;
@@ -673,38 +666,125 @@ pub fn decrypt_pkt_with_counter<'a>(
     let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
 
     let payload_len =
-        aead.open_with_u64_counter(aead_counter, header.as_ref(), ciphertext.as_mut())?;
+        aead.open_with_u64_counter(pn, header.as_ref(), ciphertext.as_mut())?;
 
     Ok(b.get_bytes(payload_len)?)
 }
 
-/// Fast PQDR decryption bypassing PacketKey object creation.
-/// Uses direct ChaCha20-Poly1305 primitives for maximum performance.
-pub fn decrypt_pkt_pqdr_fast<'a>(
-    b: &'a mut octets::OctetsMut, pn: u64, ratchet_key: &[u8; 32],
-    pn_len: usize, payload_len: usize,
-) -> Result<octets::Octets<'a>> {
+/// Decrypts a 1-RTT packet protected with PQDR-QUIC ratchet keys.
+///
+/// Candidate keys are taken from `ratchet` without modifying it, and the
+/// ratchet only advances once a candidate authenticates the packet. If
+/// `tls_aead` is given (the peer may not have switched to ratchet keys yet),
+/// the TLS key is tried first: that is a single operation, while finding
+/// where the peer's ratchet chain starts may take several.
+///
+/// Returns the plaintext and whether a ratchet key was used.
+pub fn decrypt_pkt_pqdr<'a>(
+    b: &'a mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
+    ratchet: &mut crypto::ratchet::RatchetState,
+    which: crypto::ratchet::RecvEpoch, tls_aead: Option<&crypto::Open>,
+) -> Result<(octets::Octets<'a>, bool)> {
+    let ciphertext_len = payload_len
+        .checked_sub(pn_len)
+        .ok_or(Error::InvalidPacket)?;
+
+    // Most packets are the next one on the current chain: a single key to
+    // try, so skip the general candidate search.
+    if which == crypto::ratchet::RecvEpoch::Current && tls_aead.is_none() {
+        if let Some(recv_key) = ratchet.recv_key_in_order(pn) {
+            let len = pqdr_open_in_place(
+                b,
+                ratchet.aead(),
+                recv_key.key(),
+                ciphertext_len,
+            )?;
+
+            ratchet.commit_in_order(recv_key);
+
+            return Ok((b.get_bytes(len)?, true));
+        }
+    }
+
+    // A failed AEAD open wipes the buffer, so keep a copy of the ciphertext
+    // whenever more than one key may need to be tried.
+    let backup = if tls_aead.is_some() || ratchet.recv_may_need_trial(which) {
+        Some(b.peek_bytes(ciphertext_len)?.to_vec())
+    } else {
+        None
+    };
+
+    let mut tried = false;
+
+    if let Some(aead) = tls_aead {
+        tried = true;
+
+        if let Ok(len) = tls_open_in_place(b, pn, aead, ciphertext_len) {
+            ratchet.note_tls_protected_pn(pn);
+
+            return Ok((b.get_bytes(len)?, false));
+        }
+    }
+
+    let mut attempt = 0;
+
+    while let Some(candidate) = ratchet.recv_key_candidate(which, pn, attempt) {
+        if tried {
+            match backup {
+                Some(ref backup) => restore_ciphertext(b, backup)?,
+
+                None => break,
+            }
+        }
+
+        tried = true;
+
+        if let Ok(len) =
+            pqdr_open_in_place(b, ratchet.aead(), candidate.key(), ciphertext_len)
+        {
+            ratchet.commit_recv_key(candidate)?;
+
+            return Ok((b.get_bytes(len)?, true));
+        }
+
+        attempt += 1;
+    }
+
+    Err(Error::CryptoFail)
+}
+
+fn tls_open_in_place(
+    b: &mut octets::OctetsMut, pn: u64, aead: &crypto::Open,
+    ciphertext_len: usize,
+) -> Result<usize> {
     let payload_offset = b.off();
 
     let (header, mut payload) = b.split_at(payload_offset)?;
 
-    let payload_len = payload_len
-        .checked_sub(pn_len)
-        .ok_or(Error::InvalidPacket)?;
+    let mut ciphertext = payload.peek_bytes_mut(ciphertext_len)?;
 
-    let mut ciphertext = payload.peek_bytes_mut(payload_len)?;
+    aead.open_with_u64_counter(pn, header.as_ref(), ciphertext.as_mut())
+}
 
-    // Decrypt directly with ratchet key (counter=0 since key is single-use)
-    // TODO: Extract and use KEM chunk from packet for AD matching
-    let payload_len = crypto::pqdr_open(
-        ratchet_key,
-        0,  // Counter always 0 - each ratchet key used once
-        header.as_ref(),
-        ciphertext.as_mut(),
-        None,  // TODO: KEM chunk extraction for AD
-    )?;
+fn pqdr_open_in_place(
+    b: &mut octets::OctetsMut, aead: &mut crypto::PqdrAead, key: &[u8; 32],
+    ciphertext_len: usize,
+) -> Result<usize> {
+    let payload_offset = b.off();
 
-    Ok(b.get_bytes(payload_len)?)
+    let (header, mut payload) = b.split_at(payload_offset)?;
+
+    let mut ciphertext = payload.peek_bytes_mut(ciphertext_len)?;
+
+    aead.open(key, header.as_ref(), ciphertext.as_mut())
+}
+
+fn restore_ciphertext(b: &mut octets::OctetsMut, backup: &[u8]) -> Result<()> {
+    b.peek_bytes_mut(backup.len())?
+        .as_mut()
+        .copy_from_slice(backup);
+
+    Ok(())
 }
 
 pub fn encrypt_hdr(
@@ -737,17 +817,10 @@ pub fn encrypt_pkt(
     b: &mut octets::OctetsMut, pn: u64, pn_len: usize, payload_len: usize,
     payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
 ) -> Result<usize> {
-    encrypt_pkt_with_counter(b, pn, pn, pn_len, payload_len, payload_offset, extra_in, aead)
-}
-
-pub fn encrypt_pkt_with_counter(
-    b: &mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
-    payload_offset: usize, extra_in: Option<&[u8]>, aead: &crypto::Seal,
-) -> Result<usize> {
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
     let ciphertext_len = aead.seal_with_u64_counter(
-        aead_counter,  // Use the override counter for AEAD
+        pn,
         header.as_ref(),
         payload.as_mut(),
         payload_len,
@@ -759,84 +832,51 @@ pub fn encrypt_pkt_with_counter(
     Ok(payload_offset + ciphertext_len)
 }
 
-/// Encrypt packet with separate keys for payload and header protection
+/// Encrypts a 1-RTT packet with a PQDR-QUIC ratchet key.
 ///
-/// This is used for PQDR-QUIC where payload uses per-packet ratchet keys
-/// but header protection must use a stable TLS-derived key
-pub fn encrypt_pkt_with_separate_hp(
-    b: &mut octets::OctetsMut, pn: u64, aead_counter: u64, pn_len: usize, payload_len: usize,
-    payload_offset: usize, extra_in: Option<&[u8]>,
-    payload_aead: &crypto::Seal,
-    hp_aead: &crypto::Seal,
-) -> Result<usize> {
-    let (mut header, mut payload) = b.split_at(payload_offset)?;
-
-    // Encrypt payload with the ratchet-derived key
-    let ciphertext_len = payload_aead.seal_with_u64_counter(
-        aead_counter,
-        header.as_ref(),
-        payload.as_mut(),
-        payload_len,
-        extra_in,
-    )?;
-
-    // Protect header with the stable TLS-derived key
-    encrypt_hdr(&mut header, pn_len, payload.as_ref(), hp_aead)?;
-
-    Ok(payload_offset + ciphertext_len)
-}
-
-/// Fast PQDR encryption bypassing PacketKey object creation.
-/// Uses direct ChaCha20-Poly1305 primitives for maximum performance.
+/// The payload is sealed with `ratchet_key`, optionally prefixed with a
+/// 64-byte KEM chunk, and the header is protected with the TLS key.
+#[allow(clippy::too_many_arguments)]
 pub fn encrypt_pkt_pqdr_fast(
-    b: &mut octets::OctetsMut, pn: u64, ratchet_key: &[u8; 32], pn_len: usize,
-    payload_len: usize, payload_offset: usize,
-    hp_aead: &crypto::Seal,
-    kem_chunk: Option<&[u8]>,
+    b: &mut octets::OctetsMut, pqdr_aead: &mut crypto::PqdrAead,
+    ratchet_key: &[u8; 32], pn_len: usize, payload_len: usize,
+    payload_offset: usize, hp_aead: &crypto::Seal, kem_chunk: Option<&[u8]>,
 ) -> Result<usize> {
     let (mut header, mut payload) = b.split_at(payload_offset)?;
 
-    // Encrypt payload (with optional KEM chunk prepended)
     let ciphertext_len = if let Some(chunk) = kem_chunk {
-        // Chunk must be 64 bytes
-        if chunk.len() != 64 {
+        if chunk.len() != crypto::ratchet::KEM_CHUNK_SIZE {
             return Err(Error::InvalidPacket);
         }
 
-        // Create temp buffer: [chunk || payload || space for tag]
-        let plaintext_len = 64 + payload_len;
-        let mut temp_buf = vec![0u8; plaintext_len + 16]; // +16 for Poly1305 tag
+        // Plaintext is [chunk || payload]; build it in a temporary buffer
+        // with room for the tag.
+        let plaintext_len = chunk.len() + payload_len;
+        let mut temp_buf = vec![0u8; plaintext_len + 16];
 
-        // Copy chunk
-        temp_buf[..64].copy_from_slice(chunk);
-        // Copy existing payload data
-        temp_buf[64..plaintext_len].copy_from_slice(&payload.as_ref()[..payload_len]);
+        temp_buf[..chunk.len()].copy_from_slice(chunk);
+        temp_buf[chunk.len()..plaintext_len]
+            .copy_from_slice(&payload.as_ref()[..payload_len]);
 
-        // Encrypt in temp buffer
-        let ct_len = crypto::pqdr_seal(
+        let ct_len = pqdr_aead.seal(
             ratchet_key,
-            0,  // Counter always 0 - each ratchet key used once
             header.as_ref(),
             &mut temp_buf,
             plaintext_len,
         )?;
 
-        // Copy ciphertext back to original buffer
         payload.as_mut()[..ct_len].copy_from_slice(&temp_buf[..ct_len]);
 
         ct_len
     } else {
-        // No chunk, encrypt payload normally
-        crypto::pqdr_seal(
+        pqdr_aead.seal(
             ratchet_key,
-            0,
             header.as_ref(),
             payload.as_mut(),
             payload_len,
         )?
     };
 
-    // Protect header with the stable TLS-derived key
     encrypt_hdr(&mut header, pn_len, payload.as_ref(), hp_aead)?;
 
     Ok(payload_offset + ciphertext_len)

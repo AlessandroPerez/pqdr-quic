@@ -215,6 +215,21 @@ fn target_dir_path() -> std::path::PathBuf {
     unreachable!();
 }
 
+/// Compiles C wrappers for the BoringSSL functions quiche uses that are only
+/// declared for C++ (see `src/tls/boringssl_shim.cc`).
+fn build_boringssl_shim() {
+    println!("cargo:rerun-if-changed=src/tls/boringssl_shim.cc");
+
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .file("src/tls/boringssl_shim.cc")
+        .include("deps/boringssl/include")
+        // Keep Cargo's default of re-running this script on any change.
+        .emit_rerun_if_env_changed(false)
+        .compile("quiche_bssl_shim");
+}
+
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
@@ -247,6 +262,9 @@ fn main() {
         }
 
         println!("cargo:rustc-link-search=native={build_dir}");
+
+        // Linked before (and so resolved against) libssl.
+        build_boringssl_shim();
 
         let bssl_link_kind = std::env::var("QUICHE_BSSL_LINK_KIND")
             .unwrap_or("static".to_string());

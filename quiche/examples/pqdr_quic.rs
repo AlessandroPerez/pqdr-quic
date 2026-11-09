@@ -32,7 +32,7 @@ fn main() {
     println!("  - Double-ratcheting for forward/backward secrecy");
     println!("  - ChaCha20-Poly1305 AEAD encryption");
     println!("  - BLAKE3-based key derivation");
-    println!("  - Automatic ratchet rotation every 2 minutes");
+    println!("  - Automatic ratchet rotation every 60 seconds");
     println!("  - Per-packet key derivation from ratchet chain");
     println!();
 
@@ -53,7 +53,7 @@ fn main() {
     println!();
     println!("Ratchet behavior:");
     println!("  - Symmetric ratchet: each packet gets a new encryption key");
-    println!("  - Asymmetric ratchet: ML-KEM-768 exchange every 2 minutes");
+    println!("  - Asymmetric ratchet: ML-KEM-768 exchange every 60 seconds");
     println!("  - Client and server alternate initiating ratchets");
     println!("  - Provides forward secrecy and post-compromise security");
 }

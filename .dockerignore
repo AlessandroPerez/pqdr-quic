@@ -1,0 +1,5 @@
+# Build output and local test data: large, and not needed in the image.
+target/
+test-www/*gb.bin
+performance_results.txt
+*.log

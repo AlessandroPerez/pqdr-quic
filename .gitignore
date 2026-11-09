@@ -1,6 +1,8 @@
 **/target
 **/*.rs.bk
 **/Cargo.lock
+# Pin dependency versions so builds from a fresh clone are reproducible.
+!/Cargo.lock
 **/*.*qlog
 test-www
 *.log

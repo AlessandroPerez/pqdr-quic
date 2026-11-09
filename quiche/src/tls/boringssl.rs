@@ -101,6 +101,26 @@ impl Context {
             );
         }
     }
+
+    pub fn set_prefer_chacha20(&mut self, prefer: bool) {
+        // BoringSSL orders TLS 1.3 cipher suites by whether it believes the
+        // CPU has AES instructions: without them, a client offers
+        // ChaCha20-Poly1305 first and a server prefers it. Overriding that
+        // belief is the only way to change the order.
+        let has_aes_hw = !prefer && unsafe { EVP_has_aes_hardware() } != 0;
+
+        #[cfg(not(feature = "boringssl-boring-crate"))]
+        unsafe {
+            quiche_SSL_CTX_set_aes_hw_override(
+                self.as_mut_ptr(),
+                c_int::from(has_aes_hw),
+            )
+        };
+
+        // The shim is only built with the vendored BoringSSL.
+        #[cfg(feature = "boringssl-boring-crate")]
+        let _ = has_aes_hw;
+    }
 }
 
 impl Handshake {
@@ -309,6 +329,12 @@ extern "C" {
         ctx: *mut SSL_CTX, key: *const u8, key_len: usize,
     ) -> c_int;
     fn SSL_CTX_set_early_data_enabled(ctx: *mut SSL_CTX, enabled: i32);
+
+    // From src/tls/boringssl_shim.cc.
+    #[cfg(not(feature = "boringssl-boring-crate"))]
+    fn quiche_SSL_CTX_set_aes_hw_override(ctx: *mut SSL_CTX, has_aes_hw: c_int);
+
+    fn EVP_has_aes_hardware() -> c_int;
 
     pub(super) fn SSL_CTX_set_session_cache_mode(
         ctx: *mut SSL_CTX, mode: c_int,

@@ -73,9 +73,151 @@ pub struct PartialResponse {
     pub headers: Option<Vec<quiche::h3::Header>>,
     pub priority: Option<quiche::h3::Priority>,
 
-    pub body: Vec<u8>,
+    pub body: ResponseBody,
+}
 
-    pub written: usize,
+/// How much of a response body is read from its source at a time.
+const RESPONSE_CHUNK_SIZE: usize = 256 * 1024;
+
+/// A response body, read from its source only as fast as the stream accepts
+/// it, so serving a file takes a fixed amount of memory whatever its size.
+///
+/// The source can also be a named pipe, for example one fed by a data
+/// generator, in which case the body ends when the pipe does.
+pub struct ResponseBody {
+    source: Box<dyn Read>,
+
+    /// Data read from `source` but not sent yet: `buf[off..]`.
+    buf: Vec<u8>,
+    off: usize,
+
+    /// Total size, if known in advance.
+    len: Option<u64>,
+
+    /// Bytes read from `source` so far.
+    read: u64,
+
+    /// Whether everything has been read from `source`.
+    eof: bool,
+}
+
+impl ResponseBody {
+    pub fn from_bytes(data: Vec<u8>) -> Self {
+        ResponseBody {
+            source: Box::new(std::io::empty()),
+            len: Some(data.len() as u64),
+            read: data.len() as u64,
+            buf: data,
+            off: 0,
+            eof: true,
+        }
+    }
+
+    /// Opens the file at `path`. Regular files have a known size; other
+    /// files, such as named pipes, are read until they end.
+    pub fn from_file(path: &path::Path) -> std::io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+
+        if metadata.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+
+        Ok(ResponseBody {
+            source: Box::new(file),
+            buf: Vec::new(),
+            off: 0,
+            len: metadata.is_file().then_some(metadata.len()),
+            read: 0,
+            eof: false,
+        })
+    }
+
+    /// The total size of the body, if known in advance.
+    pub fn size(&self) -> Option<u64> {
+        self.len
+    }
+
+    /// Reads the next chunk from the source, once `buf` has been sent.
+    fn fill(&mut self) {
+        let want = match self.len {
+            Some(len) => (len - self.read).min(RESPONSE_CHUNK_SIZE as u64) as usize,
+
+            None => RESPONSE_CHUNK_SIZE,
+        };
+
+        self.buf.resize(want, 0);
+        self.off = 0;
+
+        let mut filled = 0;
+
+        while filled < want {
+            match self.source.read(&mut self.buf[filled..]) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                },
+
+                Ok(n) => {
+                    filled += n;
+
+                    // Don't wait for a pipe to fill the whole buffer.
+                    if self.len.is_none() {
+                        break;
+                    }
+                },
+
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
+
+                Err(e) => {
+                    error!("failed to read response body: {e:?}");
+                    self.eof = true;
+                    break;
+                },
+            }
+        }
+
+        self.buf.truncate(filled);
+        self.read += filled as u64;
+
+        if self.len == Some(self.read) {
+            self.eof = true;
+        }
+    }
+
+    /// Sends as much of the body as the stream accepts.
+    ///
+    /// `send(data, fin)` writes a prefix of `data` to the stream, setting the
+    /// fin flag if `fin` is true and all of `data` was written, and returns
+    /// how many bytes it wrote, or `None` if it could write nothing (`Done`).
+    ///
+    /// Returns whether the whole body, and the end of the stream, was sent.
+    pub fn send<E>(
+        &mut self, mut send: impl FnMut(&[u8], bool) -> Result<Option<usize>, E>,
+    ) -> Result<bool, E> {
+        loop {
+            if self.off == self.buf.len() && !self.eof {
+                self.fill();
+            }
+
+            let data = &self.buf[self.off..];
+            let fin = self.eof;
+
+            let Some(written) = send(data, fin)? else {
+                return Ok(false);
+            };
+
+            self.off += written;
+
+            if written < data.len() {
+                return Ok(false);
+            }
+
+            if fin {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 pub type ClientId = u64;
@@ -383,7 +525,7 @@ struct Http3Request {
 }
 
 type Http3ResponseBuilderResult = std::result::Result<
-    (Vec<quiche::h3::Header>, Vec<u8>, Vec<u8>),
+    (Vec<quiche::h3::Header>, ResponseBody, Vec<u8>),
     (u64, String),
 >;
 
@@ -631,20 +773,22 @@ impl HttpConn for Http09Conn {
                         s
                     );
 
-                    let body = std::fs::read(path.as_path())
-                        .unwrap_or_else(|_| b"Not Found!\r\n".to_vec());
+                    let mut body = ResponseBody::from_file(path.as_path())
+                        .unwrap_or_else(|_| {
+                            ResponseBody::from_bytes(b"Not Found!\r\n".to_vec())
+                        });
 
                     info!(
-                        "{} sending response of size {} on stream {}",
+                        "{} sending response of size {:?} on stream {}",
                         conn.trace_id(),
-                        body.len(),
+                        body.size(),
                         s
                     );
 
-                    let written = match conn.stream_send(s, &body, true) {
+                    let complete = match body
+                        .send(|data, fin| send_09_body(conn, s, data, fin))
+                    {
                         Ok(v) => v,
-
-                        Err(quiche::Error::Done) => 0,
 
                         Err(e) => {
                             error!(
@@ -656,12 +800,11 @@ impl HttpConn for Http09Conn {
                         },
                     };
 
-                    if written < body.len() {
+                    if !complete {
                         let response = PartialResponse {
                             headers: None,
                             priority: None,
                             body,
-                            written,
                         };
 
                         partial_responses.insert(s, response);
@@ -691,26 +834,50 @@ impl HttpConn for Http09Conn {
         }
 
         let resp = partial_responses.get_mut(&stream_id).unwrap();
-        let body = &resp.body[resp.written..];
 
-        let written = match conn.stream_send(stream_id, body, true) {
-            Ok(v) => v,
+        match resp
+            .body
+            .send(|data, fin| send_09_body(conn, stream_id, data, fin))
+        {
+            Ok(true) => {
+                partial_responses.remove(&stream_id);
+            },
 
-            Err(quiche::Error::Done) => 0,
+            Ok(false) => (),
 
             Err(e) => {
                 partial_responses.remove(&stream_id);
 
                 error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
             },
-        };
-
-        resp.written += written;
-
-        if resp.written == resp.body.len() {
-            partial_responses.remove(&stream_id);
         }
+    }
+}
+
+/// Writes HTTP/0.9 response data, for `ResponseBody::send()`.
+fn send_09_body(
+    conn: &mut quiche::Connection, stream_id: u64, data: &[u8], fin: bool,
+) -> quiche::Result<Option<usize>> {
+    match conn.stream_send(stream_id, data, fin) {
+        Ok(v) => Ok(Some(v)),
+
+        Err(quiche::Error::Done) => Ok(None),
+
+        Err(e) => Err(e),
+    }
+}
+
+/// Writes HTTP/3 response data, for `ResponseBody::send()`.
+fn send_h3_body(
+    h3_conn: &mut quiche::h3::Connection, conn: &mut quiche::Connection,
+    stream_id: u64, data: &[u8], fin: bool,
+) -> quiche::h3::Result<Option<usize>> {
+    match h3_conn.send_body(conn, stream_id, data, fin) {
+        Ok(v) => Ok(Some(v)),
+
+        Err(quiche::h3::Error::Done) => Ok(None),
+
+        Err(e) => Err(e),
     }
 }
 
@@ -989,7 +1156,11 @@ impl Http3Conn {
                             quiche::h3::Header::new(b"server", b"quiche"),
                         ];
 
-                        return Ok((headers, b"".to_vec(), Default::default()));
+                        return Ok((
+                            headers,
+                            ResponseBody::from_bytes(Vec::new()),
+                            Default::default(),
+                        ));
                     },
 
                     _ => method,
@@ -1016,7 +1187,7 @@ impl Http3Conn {
 
                     return Ok((
                         headers,
-                        b"Invalid scheme".to_vec(),
+                        ResponseBody::from_bytes(b"Invalid scheme".to_vec()),
                         Default::default(),
                     ));
                 }
@@ -1098,24 +1269,29 @@ impl Http3Conn {
                     }
                 }
 
-                match std::fs::read(file_path.as_path()) {
-                    Ok(data) => (200, data),
+                match ResponseBody::from_file(file_path.as_path()) {
+                    Ok(body) => (200, body),
 
-                    Err(_) => (404, b"Not Found!".to_vec()),
+                    Err(_) => (404, ResponseBody::from_bytes(b"Not Found!".to_vec())),
                 }
             },
 
-            _ => (405, Vec::new()),
+            _ => (405, ResponseBody::from_bytes(Vec::new())),
         };
 
-        let headers = vec![
+        let mut headers = vec![
             quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
             quiche::h3::Header::new(b"server", b"quiche"),
-            quiche::h3::Header::new(
-                b"content-length",
-                body.len().to_string().as_bytes(),
-            ),
         ];
+
+        // Unknown for a body streamed from a pipe, which ends with the
+        // stream instead.
+        if let Some(len) = body.size() {
+            headers.push(quiche::h3::Header::new(
+                b"content-length",
+                len.to_string().as_bytes(),
+            ));
+        }
 
         Ok((headers, body, priority))
     }
@@ -1485,7 +1661,6 @@ impl HttpConn for Http3Conn {
                                 headers: Some(headers),
                                 priority: Some(priority),
                                 body,
-                                written: 0,
                             };
 
                             partial_responses.insert(stream_id, response);
@@ -1507,7 +1682,6 @@ impl HttpConn for Http3Conn {
                         headers: None,
                         priority: None,
                         body,
-                        written: 0,
                     };
 
                     partial_responses.insert(stream_id, response);
@@ -1638,25 +1812,23 @@ impl HttpConn for Http3Conn {
         resp.headers = None;
         resp.priority = None;
 
-        let body = &resp.body[resp.written..];
+        let h3_conn = &mut self.h3_conn;
 
-        let written = match self.h3_conn.send_body(conn, stream_id, body, true) {
-            Ok(v) => v,
+        match resp
+            .body
+            .send(|data, fin| send_h3_body(h3_conn, conn, stream_id, data, fin))
+        {
+            Ok(true) => {
+                partial_responses.remove(&stream_id);
+            },
 
-            Err(quiche::h3::Error::Done) => 0,
+            Ok(false) => (),
 
             Err(e) => {
                 partial_responses.remove(&stream_id);
 
                 error!("{} stream send failed {:?}", conn.trace_id(), e);
-                return;
             },
-        };
-
-        resp.written += written;
-
-        if resp.written == resp.body.len() {
-            partial_responses.remove(&stream_id);
         }
     }
 }

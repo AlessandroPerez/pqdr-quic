@@ -55,6 +55,9 @@ impl Context {
     pub fn set_early_data_enabled(&mut self, _enabled: bool) {
         // not yet supported
     }
+
+    /// Not supported with OpenSSL/quictls: the cipher order is unchanged.
+    pub fn set_prefer_chacha20(&mut self, _prefer: bool) {}
 }
 
 impl Handshake {

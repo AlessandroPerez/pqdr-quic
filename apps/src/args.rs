@@ -56,6 +56,8 @@ pub struct CommonArgs {
     pub qpack_blocked_streams: Option<u64>,
     pub initial_rtt: Duration,
     pub initial_cwnd_packets: u64,
+    pub pqdr_ratchet_interval: Duration,
+    pub prefer_chacha20: bool,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -82,6 +84,8 @@ pub struct CommonArgs {
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
+/// --pqdr-ratchet-interval MILLIS  PQDR-QUIC epoch length in milliseconds.
+/// --no-chacha20-preference    Don't prefer ChaCha20-Poly1305 in TLS.
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -198,6 +202,14 @@ impl Args for CommonArgs {
             .parse::<u64>()
             .unwrap();
 
+        let pqdr_ratchet_interval = Duration::from_millis(
+            args.get_str("--pqdr-ratchet-interval")
+                .parse::<u64>()
+                .unwrap(),
+        );
+
+        let prefer_chacha20 = !args.get_bool("--no-chacha20-preference");
+
         CommonArgs {
             alpns,
             max_data,
@@ -222,6 +234,8 @@ impl Args for CommonArgs {
             qpack_blocked_streams,
             initial_rtt,
             initial_cwnd_packets,
+            pqdr_ratchet_interval,
+            prefer_chacha20,
         }
     }
 }
@@ -252,6 +266,8 @@ impl Default for CommonArgs {
             qpack_blocked_streams: None,
             initial_rtt: Duration::from_millis(333),
             initial_cwnd_packets: 10,
+            pqdr_ratchet_interval: Duration::from_secs(60),
+            prefer_chacha20: true,
         }
     }
 }
@@ -298,6 +314,8 @@ Options:
   --session-file PATH      File used to cache a TLS session for resumption.
   --source-port PORT       Source port to use when connecting to the server [default: 0].
   --disable-pqdr           Disable PQDR-QUIC (use standard QUIC only).
+  --pqdr-ratchet-interval MILLIS  PQDR-QUIC epoch length in milliseconds [default: 60000].
+  --no-chacha20-preference  Let the TLS library pick the cipher (AES-GCM on CPUs with AES instructions) instead of preferring ChaCha20-Poly1305.
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   -h --help                Show this screen.
@@ -480,6 +498,8 @@ Options:
   --disable-gso               Disable GSO (linux only).
   --disable-pacing            Disable pacing (linux only).
   --disable-pqdr              Disable PQDR-QUIC (use standard QUIC only).
+  --pqdr-ratchet-interval MILLIS  PQDR-QUIC epoch length in milliseconds [default: 60000].
+  --no-chacha20-preference  Let the TLS library pick the cipher (AES-GCM on CPUs with AES instructions) instead of preferring ChaCha20-Poly1305.
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
   -h --help                   Show this screen.

@@ -120,6 +120,8 @@ fn main() {
     config.discover_pmtu(args.enable_pmtud);
     config.set_initial_rtt(conn_args.initial_rtt);
     config.set_max_idle_timeout(conn_args.idle_timeout);
+    config.set_pqdr_ratchet_interval(conn_args.pqdr_ratchet_interval);
+    config.enable_chacha20_preference(conn_args.prefer_chacha20);
     config.set_max_recv_udp_payload_size(max_datagram_size);
     config.set_max_send_udp_payload_size(max_datagram_size);
     config.set_initial_max_data(conn_args.max_data);

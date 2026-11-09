@@ -850,7 +850,7 @@ impl Frame {
                 key_material,
                 ..
             } => {
-                1 + // frame type (0x40)
+                octets::varint_len(0x40) + // frame type
                 octets::varint_len(*epoch as u64) + // epoch
                 1 + // flags byte
                 key_material.len() // key material (1184 or 1088 bytes)

@@ -13,7 +13,7 @@
 PQDR-QUIC extends QUIC with:
 - **Post-Quantum Security**: ML-KEM-768 (NIST Level 3) every 60 seconds
 - **Forward Secrecy**: Per-packet BLAKE3 key derivation (~64ns overhead)
-- **Post-Compromise Recovery**: System healing within 60 seconds of compromise
+- **Post-Compromise Recovery**: System healing within two ratchet epochs (≤120 seconds) of compromise
 - **Minimal Overhead**: Only ~2% performance impact (2352 → 2305 Mbps)
 
 📖 **[Complete PQDR Documentation](PQDR-QUIC.md)** - Architecture, security properties, benchmarks, and testing guide
@@ -32,6 +32,15 @@ docker build -t pqdr-quic-performance .
 docker run --rm pqdr-quic-performance --runs 5 --size 20
 ```
 
+Or natively (needs Rust 1.85+, a C/C++ compiler, CMake, git and `bc`):
+
+```bash
+cargo build --release --package=quiche_apps
+./performance_test.sh --runs 5 --size 20
+```
+
+The test streams its data instead of storing it, so a 20GB run needs neither 20GB of disk nor of RAM. See [Performance Testing](PQDR-QUIC.md#performance-testing).
+
 ## Key Differences from Standard quiche
 
 | Feature | Standard quiche | PQDR-QUIC |
@@ -48,7 +57,7 @@ docker run --rm pqdr-quic-performance --runs 5 --size 20
 - PQDR-QUIC: 2304.77 Mbps mean / 2329.25 Mbps median (CV: 2.0%, download 71.11s avg)
 - **Overhead: ~2.0%** ≈ 1.4 seconds for 20GB
 
-**Per-packet cost:** ~250ns (64ns BLAKE3 + 186ns AEAD context init/cleanup)
+**Per-packet cost:** one BLAKE3 compression to step the key chain (~64ns), and writing the packet key into the connection's ChaCha20-Poly1305 context. Earlier versions set up a new AEAD context for every packet (~186ns, ~250ns per packet in all); the throughput figures above were measured with that version.
 **Per-ratchet cost:** ~50μs ML-KEM-768 encapsulation
 
 ### Security Properties
@@ -58,7 +67,7 @@ docker run --rm pqdr-quic-performance --runs 5 --size 20
 - ⚡ Via BLAKE3 one-way key derivation chain
 
 **Post-Compromise Recovery (Every 60s):**
-- ✅ Full system compromise at time T only allows ≤60s of decryption
+- ✅ Full system compromise at time T only allows decryption until the end of the next epoch (≤120s)
 - ⚡ Via ML-KEM-768 key exchange introducing fresh entropy
 
 **Double Ratchet Benefits:**

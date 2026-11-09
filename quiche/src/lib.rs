@@ -607,6 +607,8 @@ pub struct Config {
     initial_rtt: Duration,
 
     pqdr_quic_enabled: bool,
+
+    pqdr_ratchet_interval: Duration,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -685,6 +687,10 @@ impl Config {
             initial_rtt: DEFAULT_INITIAL_RTT,
 
             pqdr_quic_enabled: false,
+
+            pqdr_ratchet_interval: Duration::from_millis(
+                crypto::ratchet::RATCHET_INTERVAL_MS,
+            ),
         })
     }
 
@@ -824,6 +830,20 @@ impl Config {
     /// Enables sending or receiving early data.
     pub fn enable_early_data(&mut self) {
         self.tls_ctx.set_early_data_enabled(true);
+    }
+
+    /// Makes TLS 1.3 negotiation prefer the ChaCha20-Poly1305 cipher suite
+    /// over AES-GCM, even on CPUs with AES instructions.
+    ///
+    /// By default BoringSSL prefers AES-GCM where the CPU accelerates it.
+    /// PQDR-QUIC protects packet payloads with ChaCha20-Poly1305 either way,
+    /// so enabling this on both endpoints makes plain QUIC use the same
+    /// cipher, for like-for-like performance comparisons. In PQDR-QUIC mode
+    /// it also switches header protection to ChaCha20.
+    ///
+    /// Only supported with BoringSSL. The default value is `false`.
+    pub fn enable_chacha20_preference(&mut self, enabled: bool) {
+        self.tls_ctx.set_prefer_chacha20(enabled);
     }
 
     /// Configures the list of supported application protocols.
@@ -1235,6 +1255,21 @@ impl Config {
         self.local_transport_params.pqdr_quic_supported = enabled;
     }
 
+    /// Sets the PQDR-QUIC epoch length: how often the server starts a new
+    /// ML-KEM ratchet step.
+    ///
+    /// The client sends its KEM ciphertext, and previous-epoch keys are
+    /// kept, for 1/12 of this interval (5 s of the default 60 s).
+    ///
+    /// Only the server's value matters for when epochs switch; the client's
+    /// value only affects when it sends its ciphertext, so both sides
+    /// should use the same value.
+    ///
+    /// The default is 60 seconds.
+    pub fn set_pqdr_ratchet_interval(&mut self, interval: Duration) {
+        self.pqdr_ratchet_interval = interval;
+    }
+
 }
 
 /// Tracks the health of the tx_buffered value.
@@ -1518,25 +1553,26 @@ where
     /// Whether PQDR-QUIC is enabled for this connection
     pqdr_quic_enabled: bool,
 
-    /// Whether we can actually use ratchet keys for encryption/decryption
-    /// Server: set after receiving ACK in Application epoch (client confirmed handshake)
-    /// Client: set after processing HANDSHAKE_DONE frame
+    /// PQDR-QUIC epoch length.
+    pqdr_ratchet_interval: Duration,
+
+    /// Whether we send 1-RTT packets with ratchet keys.
+    /// Server: set once HANDSHAKE_DONE has been sent.
+    /// Client: set on HANDSHAKE_DONE, or on the first ratchet-protected
+    /// packet from the server (whichever arrives first).
     pqdr_ratchet_ready: bool,
 
-    /// Time when ratchet keys should be activated (60s mark)
-    /// None if no pending activation, Some(Instant) if keys ready but waiting for 60s
-    pqdr_key_activation_time: Option<std::time::Instant>,
+    /// Packet number of the first ratchet-protected packet received from the
+    /// peer. TLS-protected 1-RTT packets are only accepted below this pn.
+    pqdr_peer_first_pn: Option<u64>,
 
-    /// True when QUIC KEY_UPDATE was triggered but activate_precomputed_epoch has not
-    /// yet been called with the actual packet number (deferred until send_single knows
-    /// the final pn after any pn-skip logic).
+    /// Server: when to switch to the next epoch (set once the client's KEM
+    /// ciphertext has been received).
+    pqdr_key_activation_time: Option<Instant>,
+
+    /// Server: the next 1-RTT packet switches epochs (flips the key phase
+    /// and activates the precomputed ratchet keys at its pn).
     pqdr_epoch_activation_pending: bool,
-
-    /// Cached PQDR Seal for current ratchet epoch (performance optimization)
-    pqdr_cached_seal: Option<crypto::Seal>,
-
-    /// Epoch number for which the cached seal is valid
-    pqdr_cached_seal_epoch: u32,
 }
 
 /// Creates a new server-side connection.
@@ -2036,11 +2072,11 @@ impl<F: BufFactory> Connection<F> {
 
             ratchet_state: None,
             pqdr_quic_enabled: config.pqdr_quic_enabled,
+            pqdr_ratchet_interval: config.pqdr_ratchet_interval,
             pqdr_ratchet_ready: false,
+            pqdr_peer_first_pn: None,
             pqdr_key_activation_time: None,
             pqdr_epoch_activation_pending: false,
-            pqdr_cached_seal: None,
-            pqdr_cached_seal_epoch: 0,
         };
 
         if let Some(odcid) = odcid {
@@ -3086,160 +3122,117 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
-        // For PQDR-QUIC: if KEY_UPDATE detected (new QUIC epoch), complete ratchet transition
-        // BEFORE computing the PQDR decrypt key, so we use the new epoch's key for this packet.
-        if self.pqdr_quic_enabled && aead_next.is_some() && epoch == packet::Epoch::Application {
-            if let Some(ref mut ratchet) = self.ratchet_state {
-                ratchet.reset_recv_packet_count();
-                if !self.is_server {
-                    if let Err(e) = ratchet.complete_client_ratchet_on_key_update(pn) {
-                        eprintln!("[PQDR-ERR] Client KEY_UPDATE FAILED pn={} err={:?}", pn, e);
-                        warn!("{} Client KEY_UPDATE: no pending WaitingToActivate ratchet: {:?}", self.trace_id, e);
-                    } else {
-                        eprintln!("[PQDR] Client ratchet activated on KEY_UPDATE pn={}", pn);
-                        info!("{} *** CLIENT RATCHET COMPLETED *** on KEY_UPDATE pn={}", self.trace_id, pn);
-                    }
-                }
-            }
-        }
-
-        // For PQDR-QUIC, use ratchet-derived keys for Application packets
-        // ONLY after both sides are ready
-        let packet_key_for_pqdr;
-        let use_pqdr_decrypt;
-
-        if self.pqdr_quic_enabled &&
-            self.pqdr_ratchet_ready &&
+        // PQDR-QUIC: once the handshake is complete, the payload of 1-RTT
+        // packets is protected with per-packet ratchet keys instead of the
+        // TLS keys (header protection still uses the TLS key).
+        //
+        // The ratchet is only advanced after a packet authenticates, so
+        // forged or corrupted packets cannot desynchronise it.
+        let pqdr_rx = self.pqdr_quic_enabled &&
             epoch == packet::Epoch::Application &&
-            self.ratchet_state.is_some()
-        {
-            // pn-indexed chain: H(chain_key_{pn-1}, pn) → (new_chain_key, enc_key)
-            let ratchet = self.ratchet_state.as_mut().unwrap();
-            let ratchet_epoch = ratchet.epoch();
+            hdr.ty == Type::Short &&
+            self.ratchet_state.is_some();
 
-            // Server: during the key-transition window, client ACKs encrypted with
-            // the previous epoch's keys arrive with the old key_phase bit still set
-            // (the client hasn't yet received and processed the KEY_UPDATE packet).
-            // aead_next.is_none() + hdr.key_phase != self.key_phase identifies exactly
-            // this case (the key_update.crypto_open branch was taken above, not
-            // the peer-initiated-key-update branch that sets aead_next).
-            let old_key_phase_pkt = self.is_server
-                && ratchet_epoch > 0
-                && aead_next.is_none()
-                && hdr.key_phase != self.key_phase;
+        // Which epoch's keys decrypted the packet, if ratchet keys were used.
+        let mut pqdr_decrypted = None;
 
-            let decrypt_epoch = if old_key_phase_pkt {
-                ratchet_epoch - 1
+        let mut payload = if pqdr_rx {
+            // The key phase tells which epoch the packet belongs to: a new
+            // key phase means the server switched epochs; an old one (for a
+            // packet sent before our last switch) means the previous epoch.
+            let which = if aead_next.is_some() {
+                crypto::ratchet::RecvEpoch::Next
+            } else if hdr.key_phase != self.key_phase {
+                crypto::ratchet::RecvEpoch::Previous
             } else {
-                ratchet_epoch
+                crypto::ratchet::RecvEpoch::Current
             };
 
-            match ratchet.decrypt_key(decrypt_epoch, pn) {
-                Ok(key) => {
-                    if pn <= 30 || pn % 10000 == 0 {
-                        eprintln!("[PQDR-RX] pn={} epoch={} key={:08x}",
-                            pn, decrypt_epoch,
-                            u32::from_be_bytes([key[0],key[1],key[2],key[3]]));
-                    }
-                    packet_key_for_pqdr = key;
-                    use_pqdr_decrypt = true;
-                },
-                Err(e) => {
-                    // If we can't decrypt with ratchet key, fall back to regular AEAD
-                    eprintln!("[PQDR-ERR] decrypt_key FAILED is_server={} pn={} decrypt_epoch={} ratchet_epoch={} err={:?}",
-                        self.is_server, pn, decrypt_epoch, ratchet_epoch, e);
-                    warn!("{} PQDR: ratchet decrypt_key failed for pn={}: {:?}",
-                        self.trace_id, pn, e);
-                    packet_key_for_pqdr = [0u8; 32];
-                    use_pqdr_decrypt = false;
-                },
-            }
-        } else {
-            use_pqdr_decrypt = false;
-            packet_key_for_pqdr = [0u8; 32];
-            if self.pqdr_quic_enabled && epoch == packet::Epoch::Application {
-                trace!(
-                    "{} PQDR: using TLS key for RX pn={} epoch={:?} ratchet_ready={} ratchet_init={}",
-                    self.trace_id,
-                    pn,
-                    epoch,
-                    self.pqdr_ratchet_ready,
-                    self.ratchet_state.is_some()
-                );
-            }
-        }
+            // TLS-protected packets are only accepted from before the peer
+            // switched to ratchet keys. Accepting them later would let
+            // anyone holding the long-lived TLS secrets inject packets,
+            // defeating post-compromise security.
+            let tls_aead = match self.pqdr_peer_first_pn {
+                Some(first_pn) if pn >= first_pn => None,
 
-        // Use fast PQDR decryption with direct ChaCha20-Poly1305 primitives
-        let mut payload = if use_pqdr_decrypt {
-            packet::decrypt_pkt_pqdr_fast(
+                _ => Some(aead),
+            };
+
+            let ratchet = self.ratchet_state.as_mut().unwrap();
+
+            let (payload, used_ratchet) = packet::decrypt_pkt_pqdr(
                 &mut b,
                 pn,
-                &packet_key_for_pqdr,
                 pn_len,
                 payload_len,
+                ratchet,
+                which,
+                tls_aead,
             )
             .map_err(|e| {
                 drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
-            })?
+            })?;
+
+            if used_ratchet {
+                pqdr_decrypted = Some(which);
+            }
+
+            payload
         } else {
-            packet::decrypt_pkt(
-                &mut b,
-                pn,
-                pn_len,
-                payload_len,
-                aead,
-            )
-            .map_err(|e| {
-                drop_pkt_on_err(e, self.recv_count, self.is_server, &self.trace_id)
-            })?
+            packet::decrypt_pkt(&mut b, pn, pn_len, payload_len, aead).map_err(
+                |e| {
+                    drop_pkt_on_err(
+                        e,
+                        self.recv_count,
+                        self.is_server,
+                        &self.trace_id,
+                    )
+                },
+            )?
         };
 
-        // PQDR-QUIC: KEY_UPDATE handling was moved BEFORE PQDR decrypt (lines ~3083-3098)
-        // so that epoch transition happens before we compute the decrypt key for this packet.
-        // Nothing to do here anymore — packet counter and ratchet were already updated.
+        if let Some(which) = pqdr_decrypted {
+            // `pqdr_decrypted` is only set when the ratchet exists.
+            let ratchet = self.ratchet_state.as_mut().unwrap();
 
-        // Extract KEM chunk from decrypted payload if PQDR is active and expecting chunks
-        if self.pqdr_quic_enabled && epoch == packet::Epoch::Application && use_pqdr_decrypt {
-            if let Some(ref mut ratchet) = self.ratchet_state {
-                // Increment packet counter for this epoch
-                ratchet.increment_recv_packet_count();
+            // The first packet the peer protected with ratchet keys starts
+            // its epoch-0 chain; TLS-protected packets are rejected from
+            // there on.
+            if self.pqdr_peer_first_pn.is_none() {
+                self.pqdr_peer_first_pn =
+                    Some(ratchet.peer_chain_start().unwrap_or(pn).min(pn));
+            }
 
-                // Check if we're expecting incoming chunks based on packet count
-                if payload.cap() >= 64 {
-                    // Try to extract chunk from first 64 bytes
-                    let chunk_bytes = &payload.as_ref()[..64];
+            // The server only switches to ratchet keys after sending
+            // HANDSHAKE_DONE, so an authenticated ratchet-protected packet
+            // lets the client switch too, even if the packet carrying
+            // HANDSHAKE_DONE was lost.
+            self.pqdr_ratchet_ready = true;
 
-                    // Check what type of chunk we're expecting (based on packet count & state)
-                    if let Some(chunk_type) = ratchet.expected_chunk_type() {
-                        // Only PublicKey is chunked; ciphertext comes via CRYPTO frame
-                        match chunk_type {
-                            crypto::ratchet::ChunkType::PublicKey => {
-                                if let Some(complete_pubkey) = ratchet.receive_pubkey_chunk(pn, chunk_bytes.to_vec()) {
-                                    info!("{} *** PUBKEY ASSEMBLED *** from {} chunks", self.trace_id, crypto::ratchet::PUBKEY_CHUNK_COUNT);
+            // PQDR-QUIC (client): the server's first packets of each epoch
+            // start with a chunk of its next ML-KEM public key. Which packets
+            // carry one, and which chunk, follows from their position in the
+            // epoch, so lost or reordered packets only cost their own chunk.
+            if let Some(index) = ratchet.incoming_chunk_index(which, pn) {
+                let chunk = payload
+                    .get_bytes(crypto::ratchet::KEM_CHUNK_SIZE)
+                    .map_err(|_| Error::InvalidPacket)?;
 
-                                    // Client: respond to ratchet (stores ciphertext for delayed sending at t=55s)
-                                    // pn is the current packet number — the new epoch starts from the next pn
-                                    let next_epoch = ratchet.epoch() + 1;
-                                    match ratchet.respond_to_ratchet(next_epoch, &complete_pubkey) {
-                                        Ok(epoch) => {
-                                            info!("{} *** RATCHET RESPONSE PREPARED *** epoch={} ciphertext will be sent at t=55s",
-                                                self.trace_id, epoch);
-                                        },
-                                        Err(e) => {
-                                            warn!("{} Failed to respond to ratchet: {:?}", self.trace_id, e);
-                                        }
-                                    }
-                                }
-                            },
-                            crypto::ratchet::ChunkType::Ciphertext => {
-                                // Ciphertext is NOT chunked - received via CRYPTO frame instead
-                                // This case should never happen with current logic
-                                warn!("{} Unexpected ciphertext chunk in packet", self.trace_id);
-                            }
-                        }
+                // A late packet from the previous epoch carries a chunk of a
+                // key that has already been used.
+                if which != crypto::ratchet::RecvEpoch::Previous {
+                    match ratchet.receive_pubkey_chunk(index, chunk.as_ref()) {
+                        Ok(Some(next_epoch)) => debug!(
+                            "{} PQDR public key for epoch {} received",
+                            self.trace_id, next_epoch
+                        ),
 
-                        // Skip the chunk in the payload - advance past the 64 bytes
-                        payload.skip(64)?;
+                        Ok(None) => (),
+
+                        Err(e) => warn!(
+                            "{} PQDR failed to encapsulate to public key: {:?}",
+                            self.trace_id, e
+                        ),
                     }
                 }
             }
@@ -3296,9 +3289,6 @@ impl<F: BufFactory> Connection<F> {
             });
 
             self.key_phase = !self.key_phase;
-
-            // Note: PQDR-QUIC packet counter reset now happens earlier (before chunk extraction)
-            // See lines ~3157 where we detect KEY_UPDATE and reset immediately
 
             qlog_with_type!(QLOG_PACKET_RX, self.qlog, q, {
                 let trigger = Some(
@@ -3902,61 +3892,30 @@ impl<F: BufFactory> Connection<F> {
             self.pqdr_ratchet_ready = true;
         }
 
-        // Check if it's time to activate ratchet keys (60s epoch boundary - PQDR-QUIC)
+        // PQDR-QUIC (server): once the epoch boundary is reached and the
+        // client's KEM ciphertext has been decapsulated, the next 1-RTT
+        // packet switches epochs. The key phase flip and the ratchet
+        // activation both happen in send_single(), once that packet's pn is
+        // known, so incoming packets never see one without the other.
         if let Some(activation_time) = self.pqdr_key_activation_time {
-            if std::time::Instant::now() >= activation_time {
-                // Always clear the timer immediately to prevent it re-firing on every
-                // subsequent send_single() call if activation fails for any reason.
+            if Instant::now() >= activation_time {
                 self.pqdr_key_activation_time = None;
 
-                let keys_ready = self.ratchet_state
+                if self
+                    .ratchet_state
                     .as_ref()
-                    .map_or(false, |r| r.has_precomputed_keys());
-
-                if keys_ready {
-                    // Trigger QUIC KEY_UPDATE now so the client detects the key_phase flip
-                    // and calls complete_client_ratchet_on_key_update(pn) with the right pn.
-                    // The actual activate_precomputed_epoch call is deferred to send_single
-                    // so it uses the final pn *after* any pn-skip logic (line ~4253).
-                    if let Err(e) = self.update_keys_from_ratchet() {
-                        warn!("{} failed to trigger QUIC KEY_UPDATE for PQDR epoch: {:?}",
-                            self.trace_id, e);
-                    } else {
-                        self.pqdr_epoch_activation_pending = true;
-                        info!("{} *** PQDR EPOCH ACTIVATION PENDING *** QUIC KEY_UPDATE triggered, \
-                               chain activation deferred to send_single",
-                            self.trace_id);
-                    }
-                } else {
-                    warn!("{} 60s timer fired but no precomputed keys (ciphertext not yet received); \
-                           epoch transition deferred", self.trace_id);
+                    .is_some_and(|r| r.has_precomputed_keys())
+                {
+                    self.pqdr_epoch_activation_pending = true;
                 }
             }
         }
 
-        // Check if we should initiate a ratchet (PQDR-QUIC)
-        // Server: fires immediately at start of each epoch, sends pubkey in first 19 packets
-        // Use pqdr_ratchet_ready (not handshake_completed) so initiate_ratchet() is called
-        // in the same send_single() pass that sets pqdr_ratchet_ready=true, ensuring the
-        // first PQDR-encrypted packet always carries chunk #0.
+        // PQDR-QUIC (client): send the KEM ciphertext shortly before the
+        // epoch boundary. (The server generates its key pairs itself, when
+        // each epoch starts.)
         if self.pqdr_quic_enabled && self.pqdr_ratchet_ready {
             if let Some(ref mut ratchet) = self.ratchet_state {
-                if ratchet.should_initiate_ratchet() {
-                    // Queue pubkey chunks — will be embedded in next 19 outgoing packets
-                    match ratchet.initiate_ratchet() {
-                        Ok(epoch) => {
-                            info!(
-                                "{} *** RATCHET INITIATED *** epoch={} pubkey chunks queued for first 19 packets",
-                                self.trace_id,
-                                epoch
-                            );
-                        },
-                        Err(e) => {
-                            warn!("{} failed to initiate ratchet: {:?}", self.trace_id, e);
-                        },
-                    }
-                }
-
                 // Check if client should send pending ciphertext (at t=55s)
                 if ratchet.should_send_ciphertext() {
                     if let Some((epoch, ciphertext)) = ratchet.take_pending_ciphertext() {
@@ -4281,39 +4240,62 @@ impl<F: BufFactory> Connection<F> {
         };
         let pn = self.next_pkt_num;
 
-        // PQDR-QUIC: complete epoch chain activation now that we know the final pn
-        // (after any pn-skip adjustment above). Both sides must use the same starting_pn;
-        // the client learns it from the pn of the KEY_UPDATE packet, which is this pn.
-        if self.pqdr_epoch_activation_pending && epoch == packet::Epoch::Application {
-            if let Some(ref mut ratchet) = self.ratchet_state {
-                match ratchet.activate_precomputed_epoch(pn) {
-                    Ok(()) => {
-                        info!("{} *** PQDR EPOCH ACTIVATED *** epoch={} starting_pn={}",
-                            self.trace_id, ratchet.epoch(), pn);
-                        // Immediately initiate the next ratchet so pubkey chunk[0] is
-                        // embedded in THIS packet (the KEY_UPDATE packet).  Without this,
-                        // the first epoch-N packet carries no chunk, but the client
-                        // already expects chunk[0] on its first epoch-N packet.
-                        if ratchet.should_initiate_ratchet() {
-                            match ratchet.initiate_ratchet() {
-                                Ok(next_epoch) => {
-                                    info!("{} *** RATCHET INITIATED (epoch activation) *** epoch={}",
-                                        self.trace_id, next_epoch);
-                                },
-                                Err(e) => {
-                                    warn!("{} initiate_ratchet after activation failed: {:?}",
-                                        self.trace_id, e);
-                                },
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        warn!("{} PQDR activate_precomputed_epoch failed at pn={}: {:?}",
-                            self.trace_id, pn, e);
-                    },
-                }
-            }
+        // PQDR-QUIC (server): switch epochs with this packet. The new
+        // epoch's server→client chain starts at this pn (after any pn skip
+        // above), and the flipped key phase tells the client to switch too.
+        if self.pqdr_epoch_activation_pending &&
+            epoch == packet::Epoch::Application
+        {
             self.pqdr_epoch_activation_pending = false;
+
+            if let Some(ratchet) = self
+                .ratchet_state
+                .as_mut()
+                .filter(|r| r.has_precomputed_keys())
+            {
+                // Rotate the TLS 1-RTT keys as in a regular QUIC key update.
+                // They no longer protect payloads, but the key phase bit is
+                // how the client detects the switch.
+                let open_next = crypto_ctx
+                    .crypto_open
+                    .as_ref()
+                    .ok_or(Error::InvalidState)?
+                    .derive_next_packet_key()?;
+
+                let seal_next = crypto_ctx
+                    .crypto_seal
+                    .as_ref()
+                    .ok_or(Error::InvalidState)?
+                    .derive_next_packet_key()?;
+
+                let open_prev = crypto_ctx.crypto_open.replace(open_next);
+                crypto_ctx.crypto_seal.replace(seal_next);
+
+                if let Some(open_prev) = open_prev {
+                    crypto_ctx.key_update = Some(packet::KeyUpdate {
+                        crypto_open: open_prev,
+                        // Any client packet still using the old key phase
+                        // predates the switch. (Client pns are a separate
+                        // space, so our own pn can't be used here.)
+                        pn_on_update: u64::MAX,
+                        update_acked: false,
+                        timer: now + (path.recovery.pto() * 3),
+                    });
+                }
+
+                self.key_phase = !self.key_phase;
+
+                // This also generates the next key pair, whose public key
+                // this packet starts carrying.
+                ratchet.activate_precomputed_epoch(pn)?;
+
+                debug!(
+                    "{} PQDR epoch {} activated at pn {}",
+                    self.trace_id,
+                    ratchet.epoch(),
+                    pn
+                );
+            }
         }
 
         let largest_acked_pkt =
@@ -4391,12 +4373,15 @@ impl<F: BufFactory> Connection<F> {
             overhead += PAYLOAD_LENGTH_LEN;
         }
 
-        // For PQDR-QUIC: if there is a KEM chunk to prepend to this packet's
-        // plaintext, reserve space for it so frames don't over-fill the buffer.
+        // For PQDR-QUIC: if this packet carries a public key chunk as a
+        // prefix of its plaintext, reserve space for it so frames don't
+        // over-fill the buffer.
         if self.pqdr_quic_enabled &&
             self.pqdr_ratchet_ready &&
             pkt_type == Type::Short &&
-            self.ratchet_state.as_ref().map_or(false, |r| r.has_outgoing_chunks())
+            self.ratchet_state
+                .as_ref()
+                .is_some_and(|r| r.outgoing_chunk(pn).is_some())
         {
             overhead += crypto::ratchet::KEM_CHUNK_SIZE;
         }
@@ -4896,7 +4881,7 @@ impl<F: BufFactory> Connection<F> {
         {
             let crypto_off = crypto_ctx.crypto_stream.send.off_front();
 
-            info!("{} attempting to create CRYPTO frame: epoch={:?} left={} crypto_off={}",
+            trace!("{} attempting to create CRYPTO frame: epoch={:?} left={} crypto_off={}",
                 self.trace_id, epoch, left, crypto_off);
 
             // Encode the frame.
@@ -4927,7 +4912,7 @@ impl<F: BufFactory> Connection<F> {
                     .send
                     .emit(&mut crypto_payload.as_mut()[..max_len])?;
 
-                info!("{} CRYPTO frame emitted: epoch={:?} offset={} len={} max_len={}",
+                trace!("{} CRYPTO frame emitted: epoch={:?} offset={} len={} max_len={}",
                     self.trace_id, epoch, crypto_off, len, max_len);
 
                 // Encode the frame's header.
@@ -5310,76 +5295,44 @@ impl<F: BufFactory> Connection<F> {
             None => return Err(Error::InvalidState),
         };
 
-        // For PQDR-QUIC, use ratchet-derived keys for Application packets
-        // ONLY after both sides have confirmed and are ready
-        let tls_aead = aead;  // Keep reference to TLS key for header protection
-        let packet_key_for_pqdr;  // Hold the ratchet key if using PQDR
-
+        // PQDR-QUIC: once switched over, 1-RTT payloads are protected with a
+        // per-packet ratchet key; header protection keeps using the TLS key.
         let use_pqdr = self.pqdr_quic_enabled &&
             self.pqdr_ratchet_ready &&
-            epoch == packet::Epoch::Application &&
+            pkt_type == Type::Short &&
             self.ratchet_state.is_some();
 
-        if use_pqdr {
-            // pn-indexed chain: H(chain_key_{pn-1}, pn) → (new_chain_key, enc_key)
+        let written = if use_pqdr {
             let ratchet = self.ratchet_state.as_mut().unwrap();
-            match ratchet.encrypt_key(pn) {
-                Ok(key) => {
-                    if pn <= 30 || pn % 10000 == 0 {
-                        eprintln!("[PQDR-TX] pn={} epoch={} key={:08x}",
-                            pn, ratchet.epoch(),
-                            u32::from_be_bytes([key[0],key[1],key[2],key[3]]));
-                    }
-                    packet_key_for_pqdr = key;
-                },
-                Err(e) => {
-                    warn!("{} PQDR: encrypt_key failed for pn={}: {:?}", self.trace_id, pn, e);
-                    packet_key_for_pqdr = [0u8; 32];
-                },
-            }
-        } else {
-            packet_key_for_pqdr = [0u8; 32];  // Dummy value, won't be used
-            if self.pqdr_quic_enabled && epoch == packet::Epoch::Application {
-                trace!(
-                    "{} PQDR: using TLS key for TX pn={} epoch={:?} ratchet_ready={} ratchet_init={}",
-                    self.trace_id,
-                    pn,
-                    epoch,
-                    self.pqdr_ratchet_ready,
-                    self.ratchet_state.is_some()
-                );
-            }
-        }
 
-        // Get KEM chunk for packet AD if available (PQDR-QUIC chunking)
-        let kem_chunk = if self.pqdr_quic_enabled && epoch == packet::Epoch::Application {
-            self.ratchet_state.as_mut().and_then(|r| r.get_next_outgoing_chunk())
-        } else {
-            None
-        };
+            // An error here means the ratchet is out of step with the packet
+            // number; the packet must not be sent with any other key.
+            let packet_key = ratchet.encrypt_key(pn)?;
 
-        let (written, used_ratchet_key) = if use_pqdr {
-            // Use fast PQDR encryption with direct ChaCha20-Poly1305 primitives
-            (packet::encrypt_pkt_pqdr_fast(
+            // The server's first packets of an epoch each carry a chunk of
+            // its next ML-KEM public key (space was reserved above).
+            let kem_chunk = ratchet.outgoing_chunk(pn).copied();
+
+            packet::encrypt_pkt_pqdr_fast(
                 &mut b,
-                pn,
-                &packet_key_for_pqdr,
+                ratchet.aead(),
+                &packet_key,
                 pn_len,
                 payload_len,
                 payload_offset,
-                tls_aead,  // TLS key for header protection
-                kem_chunk.as_deref(),  // KEM chunk prepended to plaintext
-            )?, true)
+                aead,
+                kem_chunk.as_ref().map(|c| &c[..]),
+            )?
         } else {
-            (packet::encrypt_pkt(
+            packet::encrypt_pkt(
                 &mut b,
                 pn,
                 pn_len,
                 payload_len,
                 payload_offset,
-                kem_chunk.as_deref(),  // KEM chunk in AEAD AD
-                tls_aead,
-            )?, false)
+                None,
+                aead,
+            )?
         };
 
         let sent_pkt_has_data = if path.recovery.gcongestion_enabled() {
@@ -7975,81 +7928,25 @@ impl<F: BufFactory> Connection<F> {
             // Initialize PQDR-QUIC ratchet state if enabled
             if self.pqdr_quic_enabled && self.ratchet_state.is_none() {
                 // Extract real TLS handshake secret using SSL_export_keying_material
-                let mut handshake_secret = vec![0u8; 32];
+                let mut handshake_secret = zeroize::Zeroizing::new([0u8; 32]);
                 if let Err(e) = self.handshake.export_keying_material(
                     "EXPORTER-PQDR-QUIC",
                     None,
-                    &mut handshake_secret
+                    &mut handshake_secret[..]
                 ) {
-                    error!("{} failed to export TLS keying material for PQDR-QUIC: {:?}", &self.trace_id, e);
+                    error!("{} failed to export TLS keying material for PQDR-QUIC: {:?}", self.trace_id, e);
                     return Err(e);
                 }
 
-                self.ratchet_state = Some(crypto::ratchet::RatchetState::from_handshake_secret(
-                    &handshake_secret,
-                    !self.is_server,
-                ));
+                self.ratchet_state = Some(
+                    crypto::ratchet::RatchetState::from_handshake_secret_with_interval(
+                        &handshake_secret[..],
+                        !self.is_server,
+                        self.pqdr_ratchet_interval,
+                    ),
+                );
             }
         }
-
-        Ok(())
-    }
-
-    /// Update QUIC packet keys from the current ratchet root key
-    /// This integrates ML-KEM ratchet with QUIC's KEY_UPDATE mechanism
-    fn update_keys_from_ratchet(&mut self) -> Result<()> {
-        // Trigger a standard QUIC KEY_UPDATE using next TLS-derived keys.
-        // PQDR epoch activation is separate — activate_precomputed_epoch switches
-        // the PQDR chain. This function rotates the QUIC AEAD keys so the client
-        // detects key_phase change and calls complete_client_ratchet_on_key_update.
-        let open_next = self.crypto_ctx[packet::Epoch::Application]
-            .crypto_open
-            .as_ref()
-            .ok_or(Error::InvalidState)?
-            .derive_next_packet_key()?;
-
-        let seal_next = self.crypto_ctx[packet::Epoch::Application]
-            .crypto_seal
-            .as_ref()
-            .ok_or(Error::InvalidState)?
-            .derive_next_packet_key()?;
-
-        // Save previous Open for decrypting in-flight packets
-        let open_prev = self.crypto_ctx[packet::Epoch::Application]
-            .crypto_open
-            .replace(open_next);
-
-        // Update Seal immediately — server starts sending with new QUIC keys
-        self.crypto_ctx[packet::Epoch::Application]
-            .crypto_seal
-            .replace(seal_next);
-
-        // Store previous Open in key_update for old packets
-        if let Some(open_prev) = open_prev {
-            let pto = self.paths.get_active().expect("no active path").recovery.pto();
-            self.crypto_ctx[packet::Epoch::Application].key_update = Some(packet::KeyUpdate {
-                crypto_open: open_prev,
-                pn_on_update: self.pkt_num_spaces[packet::Epoch::Application]
-                    .largest_tx_pkt_num
-                    .unwrap_or(0),
-                update_acked: false,
-                timer: std::time::Instant::now() + (pto * 3),
-            });
-        }
-
-        // Flip key_phase so the peer detects the KEY_UPDATE via the changed bit
-        // in outgoing packet headers. Without this the client's check
-        // `hdr.key_phase != self.key_phase` is always false and it never calls
-        // complete_client_ratchet_on_key_update.
-        self.key_phase = !self.key_phase;
-
-        let pqdr_epoch = self.ratchet_state.as_ref().map(|r| r.epoch()).unwrap_or(0);
-        info!(
-            "{} *** QUIC KEY_UPDATE TRIGGERED *** pqdr_epoch={} key_phase={}",
-            self.trace_id,
-            pqdr_epoch,
-            self.key_phase,
-        );
 
         Ok(())
     }
@@ -8400,58 +8297,57 @@ impl<F: BufFactory> Connection<F> {
             },
 
             frame::Frame::Crypto { data } => {
-                if data.max_off() >= MAX_CRYPTO_STREAM_OFFSET {
+                // PQDR-QUIC: the client's 1-RTT CRYPTO stream carries the
+                // client's ML-KEM ciphertexts (one per epoch) rather than TLS
+                // messages.
+                let pqdr_kem_stream = self.is_server &&
+                    self.pqdr_quic_enabled &&
+                    epoch == packet::Epoch::Application &&
+                    self.ratchet_state.is_some();
+
+                // That stream grows by one ciphertext per epoch for the life
+                // of the connection, and is consumed as it arrives, so only
+                // limit how far ahead of the consumed data it may reach.
+                let max_off_base = if pqdr_kem_stream {
+                    self.crypto_ctx[epoch].crypto_stream.recv.off_front()
+                } else {
+                    0
+                };
+
+                if data.max_off() >= max_off_base + MAX_CRYPTO_STREAM_OFFSET {
                     return Err(Error::CryptoBufferExceeded);
                 }
 
                 // Push the data to the stream so it can be re-ordered.
                 self.crypto_ctx[epoch].crypto_stream.recv.write(data)?;
 
-                // PQDR-QUIC: Check if this is a ratchet ciphertext from client
-                let mut is_ratchet_ciphertext = false;
-                if self.pqdr_quic_enabled && epoch == packet::Epoch::Application && self.is_server {
-                    if let Some(ref mut ratchet) = self.ratchet_state {
-                        // Check if we're expecting ciphertext (we initiated, waiting for response)
-                        if ratchet.has_pending_ratchet() {
-                            // Try to read exactly MLKEM768_CIPHERTEXT_SIZE from CRYPTO stream
-                            let mut ciphertext_buf = vec![0u8; crypto::ratchet::MLKEM768_CIPHERTEXT_SIZE];
-                            let stream = &mut self.crypto_ctx[epoch].crypto_stream;
+                if pqdr_kem_stream {
+                    let mut buf = [0; 512];
+                    let mut ciphertext_ready = false;
 
-                            if let Ok((read, _)) = stream.recv.emit(&mut ciphertext_buf) {
-                                if read == crypto::ratchet::MLKEM768_CIPHERTEXT_SIZE {
-                                    // Server receives ciphertext at t=55s
-                                    // Decapsulate and precompute keys for fast activation at t=60s
-                                    // pn+1 is the first packet of the new epoch (no catch-up needed)
-                                    let current_epoch = ratchet.epoch();
-                                    match ratchet.store_and_precompute_from_ciphertext(current_epoch + 1, &ciphertext_buf[..read]) {
-                                        Ok(()) => {
-                                            info!("{} *** CIPHERTEXT RECEIVED & KEYS PRECOMPUTED *** epoch={} will activate at t=60s",
-                                                self.trace_id, current_epoch + 1);
-                                            is_ratchet_ciphertext = true;
-                                            // Schedule PQDR epoch activation for 5s from now
-                                            // (ciphertext arrives at t=55s, epoch boundary is t=60s)
-                                            if self.pqdr_key_activation_time.is_none() {
-                                                self.pqdr_key_activation_time = Some(
-                                                    std::time::Instant::now() +
-                                                    std::time::Duration::from_millis(
-                                                        crypto::ratchet::RATCHET_INTERVAL_MS -
-                                                        crypto::ratchet::CLIENT_RESPONSE_TIME_MS
-                                                    )
-                                                );
-                                            }
-                                        },
-                                        Err(e) => {
-                                            warn!("{} Failed to precompute keys from ciphertext: {:?}", self.trace_id, e);
-                                        }
-                                    }
-                                }
-                            }
+                    let stream = &mut self.crypto_ctx[epoch].crypto_stream;
+                    let ratchet = self.ratchet_state.as_mut().unwrap();
+
+                    while let Ok((read, _)) = stream.recv.emit(&mut buf) {
+                        if ratchet.receive_ciphertext_bytes(&buf[..read])? {
+                            ciphertext_ready = true;
                         }
                     }
-                }
 
-                // If not a ratchet ciphertext, feed crypto data to the TLS state
-                if !is_ratchet_ciphertext {
+                    // The client sends its ciphertext shortly before the
+                    // epoch boundary; switch epochs at the boundary.
+                    if ciphertext_ready && self.pqdr_key_activation_time.is_none()
+                    {
+                        debug!(
+                            "{} PQDR ciphertext for epoch {} received",
+                            self.trace_id,
+                            ratchet.epoch() + 1
+                        );
+
+                        self.pqdr_key_activation_time =
+                            Some(Instant::now() + ratchet.client_lead());
+                    }
+                } else {
                     // Feed crypto data to the TLS state, if there's data
                     // available at the expected offset.
                     let mut crypto_buf = [0; 512];
@@ -9432,6 +9328,9 @@ pub mod test_utils;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pqdr_tests;
 
 pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;

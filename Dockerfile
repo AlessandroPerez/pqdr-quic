@@ -18,7 +18,7 @@ COPY task-killswitch/ ./task-killswitch/
 RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
 
 # Adjusted the build command to focus only on the necessary components for performance testing
-RUN cargo build --release --manifest-path apps/Cargo.toml --exclude tokio-quiche
+RUN cargo build --release --package=quiche_apps
 
 ##
 ## quiche-base: quiche image for apps
@@ -80,8 +80,9 @@ RUN git submodule update --init --recursive
 # Make the performance test script executable
 RUN chmod +x performance_test.sh
 
-# Build the project
-RUN cargo build --release
+# Build the client and server used by the performance test. (Building the
+# whole workspace would also need fontconfig headers, for qlog-dancer.)
+RUN cargo build --release --package=quiche_apps
 
 # Replace CMD with ENTRYPOINT for better argument handling
 ENTRYPOINT ["/bin/bash", "/app/performance_test.sh"]

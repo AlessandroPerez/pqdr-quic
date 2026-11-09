@@ -67,12 +67,13 @@ features = ["boringssl-boring-crate", "qlog"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [build-dependencies]
+cc = "1"
 cmake = "0.1"
 pkg-config = { version = "0.3", optional = true }
 cdylib-link-lines = { version = "0.1", optional = true }
 
 [dependencies]
-blake3 = "1.5"
+blake3 = { version = "1.5", features = ["zeroize"] }
 boring = { workspace = true, optional = true }
 chacha20poly1305 = "0.10"
 either = { version = "1.8", default-features = false }
@@ -88,6 +89,7 @@ sfv = { version = "0.9", optional = true }
 slab = "0.4"
 smallvec = { workspace = true, features = ["union"] }
 enum_dispatch = "0.3"
+zeroize = "1.8"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = [

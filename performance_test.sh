@@ -1,18 +1,41 @@
 #!/bin/bash
-set -e
+#
+# Performance test: PQDR-QUIC vs vanilla QUIC, end-to-end file transfer over
+# loopback with the quiche-server and quiche-client apps.
+#
+# No test data is stored, on disk or in memory:
+#
+# - Timed runs serve a sparse file (created instantly with `truncate`, which
+#   takes no disk space and reads back as zeros at memory speed), streamed by
+#   the server as the connection takes it. The client's output is only
+#   counted, so nothing else competes for CPU during the measurement.
+#
+# - Before the timed runs, one untimed run per configuration checks data
+#   integrity: random data from /dev/urandom is streamed through a named
+#   pipe and hashed on both sides. (Hashing during the timed runs would slow
+#   them down noticeably on machines with few cores.)
+#
+# Both configurations use ChaCha20-Poly1305 (the apps prefer it by default),
+# so the comparison isolates the cost of PQDR-QUIC's per-packet ratchet.
 
-# Performance test script for PQDR-QUIC vs Vanilla QUIC
-# Tests 20GB file transfer end-to-end
+set -uo pipefail
 
 cd "$(dirname "$0")"
 
-# Default file size in GB
 FILE_SIZE_GB=20
-
-# Default number of runs
 RUNS=1
+VERIFY=1
+PORT=4433
 
-# Parse command-line arguments
+usage() {
+    echo "Usage: $0 [--runs N] [--size GB] [--no-verify] [--port PORT]"
+    echo "  --runs N     Number of timed runs per configuration (default: 1)"
+    echo "  --size GB    Transfer size in GiB (default: 20)"
+    echo "  --no-verify  Skip the data integrity check"
+    echo "  --port PORT  UDP port for the server (default: 4433)"
+    echo "  --help       Show this help message"
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --runs)
@@ -23,26 +46,30 @@ while [[ $# -gt 0 ]]; do
             FILE_SIZE_GB="$2"
             shift 2
             ;;
+        --no-verify)
+            VERIFY=0
+            shift
+            ;;
+        --port)
+            PORT="$2"
+            shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 [--runs N] [--size SIZE]"
-            echo "  --runs N    Number of test runs per configuration (default: 1)"
-            echo "  --size SIZE File size in GB (default: 20)"
-            echo "  --help      Show this help message"
+            usage
             exit 0
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Use --help for usage information"
+            usage
             exit 1
             ;;
     esac
 done
 
-# Update file name based on size
-FILE="test_${FILE_SIZE_GB}gb.bin"
-SERVER_FILE="test-www/$FILE"
-CLIENT_FILE="/tmp/quic_download_$FILE"
+SERVER_BIN=./target/release/quiche-server
+CLIENT_BIN=./target/release/quiche-client
 RESULTS_FILE="performance_results.txt"
+FILE_SIZE_BYTES=$((FILE_SIZE_GB * 1024 * 1024 * 1024))
 
 # Colors for output
 GREEN='\033[0;32m'
@@ -51,45 +78,159 @@ RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
+for tool in bc mkfifo truncate timeout; do
+    if ! command -v "$tool" > /dev/null; then
+        echo -e "${RED}Error: '$tool' is required but not installed${NC}"
+        exit 1
+    fi
+done
+
+if [ ! -x "$SERVER_BIN" ] || [ ! -x "$CLIENT_BIN" ]; then
+    echo -e "${RED}Error: $SERVER_BIN and $CLIENT_BIN not found${NC}"
+    echo "Build them first with: cargo build --release --package=quiche_apps"
+    exit 1
+fi
+
+if command -v b3sum > /dev/null; then
+    HASH_TOOL=b3sum
+else
+    HASH_TOOL=md5sum
+fi
+
+# Test data lives in a temporary directory (the sparse file takes no space).
+WWW=$(mktemp -d)
+SERVER_LOG="$WWW/server.log"
+SERVER_PID=
+
+GENERATOR_PID=
+
+# Stops the random data generator, which may be blocked on the named pipe.
+stop_generator() {
+    if [ -n "$GENERATOR_PID" ]; then
+        # Opening the pipe for reading unblocks a writer waiting to open it;
+        # closing it makes the writer fail.
+        if [ -p "$WWW/random.bin" ]; then
+            timeout 1 cat "$WWW/random.bin" > /dev/null 2>&1 || true
+        fi
+
+        wait "$GENERATOR_PID" 2> /dev/null || true
+        GENERATOR_PID=
+    fi
+
+    rm -f "$WWW/random.bin"
+}
+
+cleanup() {
+    stop_server
+    stop_generator
+    rm -rf "$WWW"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+truncate -s "$FILE_SIZE_BYTES" "$WWW/zeros.bin"
+
+COMMON_ARGS=(
+    --max-data 25000000000
+    --max-stream-data 25000000000
+    --idle-timeout 300000
+)
+
 echo "=============================================="
 echo "QUIC Performance Test - ${FILE_SIZE_GB}GB File Transfer"
 echo "Runs per configuration: $RUNS"
 echo "=============================================="
 echo ""
 
-# Ensure the test file exists, or create it if missing
-if [ ! -f "$SERVER_FILE" ]; then
-    echo -e "${YELLOW}Creating $SERVER_FILE (${FILE_SIZE_GB}GB)...${NC}"
-    mkdir -p "$(dirname "$SERVER_FILE")"
-    dd if=/dev/urandom of="$SERVER_FILE" bs=1M count=$((FILE_SIZE_GB * 1024))
-fi
+# start_server <pqdr: true|false>
+start_server() {
+    local extra=()
 
-# Check if file exists
-if [ ! -f "$SERVER_FILE" ]; then
-    echo -e "${RED}Error: $SERVER_FILE does not exist${NC}"
-    echo "Please create it first with: dd if=/dev/urandom of=$SERVER_FILE bs=1M count=20480"
-    exit 1
-fi
-
-# Calculate or load server-side hash
-HASH_FILE="$SERVER_FILE.blake3"
-if [ -f "$HASH_FILE" ]; then
-    echo -e "${BLUE}Loading cached server-side BLAKE3 hash...${NC}"
-    SERVER_HASH=$(cat "$HASH_FILE")
-    echo "Server BLAKE3: $SERVER_HASH"
-else
-    echo -e "${BLUE}Calculating server-side BLAKE3 hash (this will take a minute)...${NC}"
-    if command -v b3sum &> /dev/null; then
-        SERVER_HASH=$(b3sum "$SERVER_FILE" | awk '{print $1}')
-    else
-        echo "BLAKE3 not found, using MD5..."
-        SERVER_HASH=$(md5sum "$SERVER_FILE" | awk '{print $1}')
-        HASH_FILE="$SERVER_FILE.md5"
+    if [ "$1" != "true" ]; then
+        extra+=(--disable-pqdr)
     fi
-    echo "$SERVER_HASH" > "$HASH_FILE"
-    echo "Server hash: $SERVER_HASH (saved to $HASH_FILE)"
-fi
-echo ""
+
+    "$SERVER_BIN" \
+        --listen "127.0.0.1:$PORT" \
+        --cert apps/src/bin/cert.crt \
+        --key apps/src/bin/cert.key \
+        --root "$WWW" \
+        "${COMMON_ARGS[@]}" \
+        "${extra[@]}" > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+
+    sleep 2
+
+    if ! kill -0 "$SERVER_PID" 2> /dev/null; then
+        echo -e "${RED}Server failed to start!${NC}" >&2
+        cat "$SERVER_LOG" >&2
+        exit 1
+    fi
+}
+
+stop_server() {
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2> /dev/null || true
+        wait "$SERVER_PID" 2> /dev/null || true
+        SERVER_PID=
+    fi
+}
+
+# download <pqdr: true|false> <file>: writes the response body to stdout.
+download() {
+    local extra=()
+
+    if [ "$1" != "true" ]; then
+        extra+=(--disable-pqdr)
+    fi
+
+    "$CLIENT_BIN" \
+        --no-verify \
+        "${COMMON_ARGS[@]}" \
+        "${extra[@]}" \
+        "https://127.0.0.1:$PORT/$2" 2> /dev/null
+}
+
+# verify_integrity <name> <pqdr: true|false>: sets INTEGRITY to PASS or FAIL.
+verify_integrity() {
+    local test_name=$1
+    local pqdr_enabled=$2
+
+    echo -e "${BLUE}Checking data integrity: $test_name (${FILE_SIZE_GB}GB of random data)...${NC}"
+
+    rm -f "$WWW/random.bin" "$WWW/sent.hash"
+    mkfifo "$WWW/random.bin"
+
+    # The generator blocks until the server opens the pipe, and its output
+    # is hashed as the server reads it.
+    head -c "$FILE_SIZE_BYTES" /dev/urandom |
+        tee "$WWW/random.bin" |
+        "$HASH_TOOL" | awk '{print $1}' > "$WWW/sent.hash" &
+    GENERATOR_PID=$!
+
+    start_server "$pqdr_enabled"
+
+    local received
+    received=$(download "$pqdr_enabled" random.bin | "$HASH_TOOL" | awk '{print $1}')
+
+    # If the transfer was cut short, the generator only stops once the
+    # server has closed the pipe.
+    stop_server
+    stop_generator
+
+    local sent
+    sent=$(cat "$WWW/sent.hash" 2> /dev/null)
+
+    if [ -n "$sent" ] && [ "$sent" = "$received" ]; then
+        echo -e "${GREEN}✓ Hashes match ($HASH_TOOL $sent)${NC}"
+        INTEGRITY=PASS
+    else
+        echo -e "${RED}✗ Hashes do not match!${NC}"
+        echo "  Sent:     $sent"
+        echo "  Received: $received"
+        INTEGRITY=FAIL
+    fi
+}
 
 # Function to calculate statistics
 calculate_stats() {
@@ -97,7 +238,7 @@ calculate_stats() {
     local count=${#values[@]}
 
     if [ $count -eq 0 ]; then
-        echo "0 0 0 0 0"
+        echo "0 0 0 0 0 0"
         return
     fi
 
@@ -138,132 +279,52 @@ calculate_stats() {
     local max=${sorted[$((count - 1))]}
 
     # Coefficient of variation (CV%)
-    local cv=$(echo "scale=2; ($stddev / $mean) * 100" | bc)
+    local cv=$(echo "scale=2; $stddev * 100 / $mean" | bc)
 
     echo "$mean $median $stddev $min $max $cv"
 }
 
-# Function to run a single test
+# run_test <name> <pqdr: true|false> <run number>: sets DOWNLOAD_TIME,
+# THROUGHPUT and BYTES_RECEIVED.
 run_test() {
     local test_name=$1
     local pqdr_enabled=$2
     local run_number=$3
 
-    echo "==============================================" >&2
-    echo -e "${GREEN}Test: $test_name (Run $run_number/$RUNS)${NC}" >&2
-    echo "==============================================" >&2
+    echo "=============================================="
+    echo -e "${GREEN}Test: $test_name (Run $run_number/$RUNS)${NC}"
+    echo "=============================================="
 
-    # Clean up previous download
-    rm -f "$CLIENT_FILE"
+    start_server "$pqdr_enabled"
 
-    # Start server (idle-timeout set to 300s = 5 minutes for large file transfers)
-    echo -e "${BLUE}Starting server...${NC}" >&2
-    if [ "$pqdr_enabled" = "true" ]; then
-        ./target/release/quiche-server \
-            --listen 127.0.0.1:4433 \
-            --cert apps/src/bin/cert.crt \
-            --key apps/src/bin/cert.key \
-            --root test-www \
-            --max-data 25000000000 \
-            --max-stream-data 25000000000 \
-            --idle-timeout 300000 > /tmp/server_perf.log 2>&1 &
-    else
-        ./target/release/quiche-server \
-            --listen 127.0.0.1:4433 \
-            --cert apps/src/bin/cert.crt \
-            --key apps/src/bin/cert.key \
-            --root test-www \
-            --max-data 25000000000 \
-            --max-stream-data 25000000000 \
-            --idle-timeout 300000 \
-            --disable-pqdr > /tmp/server_perf.log 2>&1 &
-    fi
-    SERVER_PID=$!
-    sleep 3
+    echo -e "${BLUE}Downloading ${FILE_SIZE_GB}GB...${NC}"
+    echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    if ! ps -p $SERVER_PID > /dev/null 2>&1; then
-        echo -e "${RED}Server failed to start!${NC}" >&2
-        cat /tmp/server_perf.log >&2
-        return 1
-    fi
+    local start_time end_time
+    start_time=$(date +%s.%N)
+    BYTES_RECEIVED=$(download "$pqdr_enabled" zeros.bin | wc -c)
+    end_time=$(date +%s.%N)
 
-    echo -e "${BLUE}Downloading ${FILE_SIZE_GB}GB file...${NC}" >&2
-    echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')" >&2
+    stop_server
 
-    # Measure total time including download and hash verification
-    START_TIME=$(date +%s.%N)
+    echo "Download completed at: $(date '+%Y-%m-%d %H:%M:%S')"
 
-    # Download file (with 5-minute idle timeout for large files)
-    if [ "$pqdr_enabled" = "true" ]; then
-        ./target/release/quiche-client \
-            --no-verify \
-            --max-data 25000000000 \
-            --max-stream-data 25000000000 \
-            --idle-timeout 300000 \
-            https://127.0.0.1:4433/$FILE > "$CLIENT_FILE" 2>/dev/null
-    else
-        ./target/release/quiche-client \
-            --no-verify \
-            --max-data 25000000000 \
-            --max-stream-data 25000000000 \
-            --idle-timeout 300000 \
-            --disable-pqdr \
-            https://127.0.0.1:4433/$FILE > "$CLIENT_FILE" 2>/dev/null
-    fi
+    DOWNLOAD_TIME=$(echo "$end_time - $start_time" | bc)
 
-    DOWNLOAD_END=$(date +%s.%N)
-
-    echo "Download completed at: $(date '+%Y-%m-%d %H:%M:%S')" >&2
-
-    # Calculate client-side hash
-    echo -e "${BLUE}Calculating client-side hash...${NC}" >&2
-    if command -v b3sum &> /dev/null; then
-        CLIENT_HASH=$(b3sum "$CLIENT_FILE" | awk '{print $1}')
-    else
-        CLIENT_HASH=$(md5sum "$CLIENT_FILE" | awk '{print $1}')
-    fi
-
-    HASH_END=$(date +%s.%N)
-
-    echo "Hash verification completed at: $(date '+%Y-%m-%d %H:%M:%S')" >&2
-
-    # Stop server
-    kill $SERVER_PID 2>/dev/null || true
-    wait $SERVER_PID 2>/dev/null || true
-
-    # Calculate times
-    DOWNLOAD_TIME=$(echo "$DOWNLOAD_END - $START_TIME" | bc)
-    TOTAL_TIME=$(echo "$HASH_END - $START_TIME" | bc)
-    HASH_TIME=$(echo "$HASH_END - $DOWNLOAD_END" | bc)
-
-    # Calculate throughput (20GB in bytes / time in seconds = bytes/sec, convert to Mbps)
+    # Megabits computed as GiB * 1024 * 8, as in the published results.
     THROUGHPUT=$(echo "scale=2; (${FILE_SIZE_GB} * 1024 * 8) / $DOWNLOAD_TIME" | bc)
 
-    # Verify integrity
-    if [ "$SERVER_HASH" = "$CLIENT_HASH" ]; then
-        echo -e "${GREEN}✓ SUCCESS: Hashes match!${NC}" >&2
-        INTEGRITY="PASS"
-    else
-        echo -e "${RED}✗ FAILURE: Hashes do not match!${NC}" >&2
-        echo "Server: $SERVER_HASH" >&2
-        echo "Client: $CLIENT_HASH" >&2
-        INTEGRITY="FAIL"
+    if [ "$BYTES_RECEIVED" != "$FILE_SIZE_BYTES" ]; then
+        echo -e "${RED}✗ Received $BYTES_RECEIVED bytes, expected $FILE_SIZE_BYTES${NC}"
+        INCOMPLETE_TRANSFERS=$((INCOMPLETE_TRANSFERS + 1))
     fi
 
-    echo "" >&2
-    echo "=== Run $run_number Results ===" >&2
-    echo "Download time:      ${DOWNLOAD_TIME}s" >&2
-    echo "Hash time:          ${HASH_TIME}s" >&2
-    echo "Total time:         ${TOTAL_TIME}s" >&2
-    echo "Throughput:         ${THROUGHPUT} Mbps" >&2
-    echo "Integrity check:    $INTEGRITY" >&2
-    echo "" >&2
-
-    # Cleanup
-    rm -f "$CLIENT_FILE"
-
-    # Return values as space-separated string
-    echo "$DOWNLOAD_TIME $TOTAL_TIME $HASH_TIME $THROUGHPUT $INTEGRITY"
+    echo ""
+    echo "=== Run $run_number Results ==="
+    echo "Download time:      ${DOWNLOAD_TIME}s"
+    echo "Throughput:         ${THROUGHPUT} Mbps"
+    echo "Bytes received:     ${BYTES_RECEIVED}"
+    echo ""
 
     sleep 2
 }
@@ -271,68 +332,115 @@ run_test() {
 # Clear previous results
 echo "Performance Test Results - $(date)" > "$RESULTS_FILE"
 echo "Number of runs per configuration: $RUNS" >> "$RESULTS_FILE"
+echo "Transfer size: ${FILE_SIZE_GB}GB" >> "$RESULTS_FILE"
 echo "========================================" >> "$RESULTS_FILE"
 echo "" >> "$RESULTS_FILE"
 
+# Integrity checks
+vanilla_integrity="SKIPPED"
+pqdr_integrity="SKIPPED"
+
+if [ "$VERIFY" = "1" ]; then
+    verify_integrity "Vanilla QUIC" "false"
+    vanilla_integrity=$INTEGRITY
+
+    verify_integrity "PQDR-QUIC" "true"
+    pqdr_integrity=$INTEGRITY
+    echo ""
+
+    echo "Integrity check (random data, $HASH_TOOL):" >> "$RESULTS_FILE"
+    echo "  Vanilla QUIC: $vanilla_integrity" >> "$RESULTS_FILE"
+    echo "  PQDR-QUIC:    $pqdr_integrity" >> "$RESULTS_FILE"
+    echo "" >> "$RESULTS_FILE"
+fi
+
+INCOMPLETE_TRANSFERS=0
+
 # Arrays to store results
 declare -a vanilla_download_times
-declare -a vanilla_total_times
-declare -a vanilla_hash_times
 declare -a vanilla_throughputs
 declare -a pqdr_download_times
-declare -a pqdr_total_times
-declare -a pqdr_hash_times
 declare -a pqdr_throughputs
 
-# Run Vanilla QUIC tests
-echo ""
-echo "=============================================="
-echo -e "${YELLOW}Running Vanilla QUIC Tests${NC}"
-echo "=============================================="
-echo ""
+# run_config <name> <pqdr: true|false> <array prefix>
+run_config() {
+    local name=$1
+    local pqdr_enabled=$2
+    local prefix=$3
 
-for i in $(seq 1 $RUNS); do
-    result=$(run_test "Vanilla QUIC (Standard)" "false" "$i")
-    read -r dl_time tot_time hash_time throughput integrity <<< "$result"
-    vanilla_download_times+=("$dl_time")
-    vanilla_total_times+=("$tot_time")
-    vanilla_hash_times+=("$hash_time")
-    vanilla_throughputs+=("$throughput")
+    echo ""
+    echo "=============================================="
+    echo -e "${YELLOW}Running $name Tests${NC}"
+    echo "=============================================="
+    echo ""
 
-    # Save individual result
-    echo "=== Vanilla QUIC - Run $i ===" >> "$RESULTS_FILE"
-    echo "Download time:      ${dl_time}s" >> "$RESULTS_FILE"
-    echo "Hash time:          ${hash_time}s" >> "$RESULTS_FILE"
-    echo "Total time:         ${tot_time}s" >> "$RESULTS_FILE"
-    echo "Throughput:         ${throughput} Mbps" >> "$RESULTS_FILE"
-    echo "Integrity check:    $integrity" >> "$RESULTS_FILE"
-    echo "" >> "$RESULTS_FILE"
-done
+    for i in $(seq 1 "$RUNS"); do
+        run_test "$name" "$pqdr_enabled" "$i"
 
-# Run PQDR-QUIC tests
-echo ""
-echo "=============================================="
-echo -e "${YELLOW}Running PQDR-QUIC Tests${NC}"
-echo "=============================================="
-echo ""
+        eval "${prefix}_download_times+=(\"$DOWNLOAD_TIME\")"
+        eval "${prefix}_throughputs+=(\"$THROUGHPUT\")"
 
-for i in $(seq 1 $RUNS); do
-    result=$(run_test "PQDR-QUIC (Post-Quantum Double-Ratchet)" "true" "$i")
-    read -r dl_time tot_time hash_time throughput integrity <<< "$result"
-    pqdr_download_times+=("$dl_time")
-    pqdr_total_times+=("$tot_time")
-    pqdr_hash_times+=("$hash_time")
-    pqdr_throughputs+=("$throughput")
+        # Save individual result
+        echo "=== $name - Run $i ===" >> "$RESULTS_FILE"
+        echo "Download time:      ${DOWNLOAD_TIME}s" >> "$RESULTS_FILE"
+        echo "Throughput:         ${THROUGHPUT} Mbps" >> "$RESULTS_FILE"
+        echo "Bytes received:     ${BYTES_RECEIVED}" >> "$RESULTS_FILE"
+        echo "" >> "$RESULTS_FILE"
+    done
+}
 
-    # Save individual result
-    echo "=== PQDR-QUIC - Run $i ===" >> "$RESULTS_FILE"
-    echo "Download time:      ${dl_time}s" >> "$RESULTS_FILE"
-    echo "Hash time:          ${hash_time}s" >> "$RESULTS_FILE"
-    echo "Total time:         ${tot_time}s" >> "$RESULTS_FILE"
-    echo "Throughput:         ${throughput} Mbps" >> "$RESULTS_FILE"
-    echo "Integrity check:    $integrity" >> "$RESULTS_FILE"
-    echo "" >> "$RESULTS_FILE"
-done
+run_config "Vanilla QUIC" "false" vanilla
+run_config "PQDR-QUIC" "true" pqdr
+
+# print_stats <name> <throughputs...> -- <download times...>
+print_stats() {
+    local name=$1
+    shift
+
+    local throughputs=()
+    while [ "$1" != "--" ]; do
+        throughputs+=("$1")
+        shift
+    done
+    shift
+
+    local mean median stddev min max cv
+    read -r mean median stddev min max cv <<< "$(calculate_stats "${throughputs[@]}")"
+
+    local dl_mean dl_median dl_stddev dl_min dl_max dl_cv
+    read -r dl_mean dl_median dl_stddev dl_min dl_max dl_cv <<< "$(calculate_stats "$@")"
+
+    {
+        echo "Throughput:"
+        echo "  Mean:     ${mean} Mbps"
+        echo "  Median:   ${median} Mbps"
+        echo "  StdDev:   ${stddev} Mbps"
+        echo "  Min:      ${min} Mbps"
+        echo "  Max:      ${max} Mbps"
+        echo "  CV:       ${cv}%"
+        echo ""
+        echo "Download Time:"
+        echo "  Mean:     ${dl_mean}s"
+        echo "  Median:   ${dl_median}s"
+        echo "  StdDev:   ${dl_stddev}s"
+        echo "  Min:      ${dl_min}s"
+        echo "  Max:      ${dl_max}s"
+        echo ""
+    } > "$WWW/stats.txt"
+
+    echo -e "${BLUE}$name Statistics:${NC}"
+    sed 's/^/  /' "$WWW/stats.txt"
+
+    {
+        echo "=================================="
+        echo "$name - Aggregate Statistics"
+        echo "=================================="
+        cat "$WWW/stats.txt"
+    } >> "$RESULTS_FILE"
+
+    LAST_MEAN=$mean
+    LAST_DL_MEAN=$dl_mean
+}
 
 # Calculate and display aggregate statistics
 echo ""
@@ -341,106 +449,34 @@ echo -e "${GREEN}Aggregate Statistics${NC}"
 echo "=============================================="
 echo ""
 
-# Vanilla QUIC stats
-echo -e "${BLUE}Vanilla QUIC Statistics:${NC}"
-read -r mean median stddev min max cv <<< $(calculate_stats "${vanilla_throughputs[@]}")
-echo "  Throughput:"
-echo "    Mean:     ${mean} Mbps"
-echo "    Median:   ${median} Mbps"
-echo "    StdDev:   ${stddev} Mbps"
-echo "    Min:      ${min} Mbps"
-echo "    Max:      ${max} Mbps"
-echo "    CV:       ${cv}%"
-echo ""
+print_stats "Vanilla QUIC" "${vanilla_throughputs[@]}" -- "${vanilla_download_times[@]}"
+mean=$LAST_MEAN
+dl_mean=$LAST_DL_MEAN
 
-read -r dl_mean dl_median dl_stddev dl_min dl_max dl_cv <<< $(calculate_stats "${vanilla_download_times[@]}")
-echo "  Download Time:"
-echo "    Mean:     ${dl_mean}s"
-echo "    Median:   ${dl_median}s"
-echo "    StdDev:   ${dl_stddev}s"
-echo "    Min:      ${dl_min}s"
-echo "    Max:      ${dl_max}s"
-echo ""
-
-# Save vanilla stats to file
-echo "==================================" >> "$RESULTS_FILE"
-echo "Vanilla QUIC - Aggregate Statistics" >> "$RESULTS_FILE"
-echo "==================================" >> "$RESULTS_FILE"
-echo "Throughput:" >> "$RESULTS_FILE"
-echo "  Mean:     ${mean} Mbps" >> "$RESULTS_FILE"
-echo "  Median:   ${median} Mbps" >> "$RESULTS_FILE"
-echo "  StdDev:   ${stddev} Mbps" >> "$RESULTS_FILE"
-echo "  Min:      ${min} Mbps" >> "$RESULTS_FILE"
-echo "  Max:      ${max} Mbps" >> "$RESULTS_FILE"
-echo "  CV:       ${cv}%" >> "$RESULTS_FILE"
-echo "" >> "$RESULTS_FILE"
-echo "Download Time:" >> "$RESULTS_FILE"
-echo "  Mean:     ${dl_mean}s" >> "$RESULTS_FILE"
-echo "  Median:   ${dl_median}s" >> "$RESULTS_FILE"
-echo "  StdDev:   ${dl_stddev}s" >> "$RESULTS_FILE"
-echo "  Min:      ${dl_min}s" >> "$RESULTS_FILE"
-echo "  Max:      ${dl_max}s" >> "$RESULTS_FILE"
-echo "" >> "$RESULTS_FILE"
-
-# PQDR-QUIC stats
-echo -e "${BLUE}PQDR-QUIC Statistics:${NC}"
-read -r pqdr_mean pqdr_median pqdr_stddev pqdr_min pqdr_max pqdr_cv <<< $(calculate_stats "${pqdr_throughputs[@]}")
-echo "  Throughput:"
-echo "    Mean:     ${pqdr_mean} Mbps"
-echo "    Median:   ${pqdr_median} Mbps"
-echo "    StdDev:   ${pqdr_stddev} Mbps"
-echo "    Min:      ${pqdr_min} Mbps"
-echo "    Max:      ${pqdr_max} Mbps"
-echo "    CV:       ${pqdr_cv}%"
-echo ""
-
-read -r pqdr_dl_mean pqdr_dl_median pqdr_dl_stddev pqdr_dl_min pqdr_dl_max pqdr_dl_cv <<< $(calculate_stats "${pqdr_download_times[@]}")
-echo "  Download Time:"
-echo "    Mean:     ${pqdr_dl_mean}s"
-echo "    Median:   ${pqdr_dl_median}s"
-echo "    StdDev:   ${pqdr_dl_stddev}s"
-echo "    Min:      ${pqdr_dl_min}s"
-echo "    Max:      ${pqdr_dl_max}s"
-echo ""
-
-# Save PQDR stats to file
-echo "==================================" >> "$RESULTS_FILE"
-echo "PQDR-QUIC - Aggregate Statistics" >> "$RESULTS_FILE"
-echo "==================================" >> "$RESULTS_FILE"
-echo "Throughput:" >> "$RESULTS_FILE"
-echo "  Mean:     ${pqdr_mean} Mbps" >> "$RESULTS_FILE"
-echo "  Median:   ${pqdr_median} Mbps" >> "$RESULTS_FILE"
-echo "  StdDev:   ${pqdr_stddev} Mbps" >> "$RESULTS_FILE"
-echo "  Min:      ${pqdr_min} Mbps" >> "$RESULTS_FILE"
-echo "  Max:      ${pqdr_max} Mbps" >> "$RESULTS_FILE"
-echo "  CV:       ${pqdr_cv}%" >> "$RESULTS_FILE"
-echo "" >> "$RESULTS_FILE"
-echo "Download Time:" >> "$RESULTS_FILE"
-echo "  Mean:     ${pqdr_dl_mean}s" >> "$RESULTS_FILE"
-echo "  Median:   ${pqdr_dl_median}s" >> "$RESULTS_FILE"
-echo "  StdDev:   ${pqdr_dl_stddev}s" >> "$RESULTS_FILE"
-echo "  Min:      ${pqdr_dl_min}s" >> "$RESULTS_FILE"
-echo "  Max:      ${pqdr_dl_max}s" >> "$RESULTS_FILE"
-echo "" >> "$RESULTS_FILE"
+print_stats "PQDR-QUIC" "${pqdr_throughputs[@]}" -- "${pqdr_download_times[@]}"
+pqdr_mean=$LAST_MEAN
+pqdr_dl_mean=$LAST_DL_MEAN
 
 # Performance comparison
 echo -e "${BLUE}Performance Comparison:${NC}"
-if [ "$RUNS" -gt 1 ]; then
-    overhead=$(echo "scale=2; (($dl_mean - $pqdr_dl_mean) / $dl_mean) * 100" | bc)
-    throughput_diff=$(echo "scale=2; (($mean - $pqdr_mean) / $mean) * 100" | bc)
+# Multiply before dividing: bc truncates every intermediate result to `scale`
+# decimal places.
+overhead=$(echo "scale=2; ($pqdr_dl_mean - $dl_mean) * 100 / $dl_mean" | bc)
+throughput_diff=$(echo "scale=2; ($mean - $pqdr_mean) * 100 / $mean" | bc)
 
-    echo "  PQDR vs Vanilla:"
-    echo "    Throughput difference: ${throughput_diff}%"
-    echo "    Download time overhead: ${overhead}%"
+echo "  PQDR vs Vanilla:"
+echo "    Throughput difference: ${throughput_diff}%"
+echo "    Download time overhead: ${overhead}%"
 
-    echo "" >> "$RESULTS_FILE"
-    echo "==================================" >> "$RESULTS_FILE"
-    echo "Performance Comparison" >> "$RESULTS_FILE"
-    echo "==================================" >> "$RESULTS_FILE"
-    echo "PQDR vs Vanilla:" >> "$RESULTS_FILE"
-    echo "  Throughput difference: ${throughput_diff}%" >> "$RESULTS_FILE"
-    echo "  Download time overhead: ${overhead}%" >> "$RESULTS_FILE"
-fi
+{
+    echo ""
+    echo "=================================="
+    echo "Performance Comparison"
+    echo "=================================="
+    echo "PQDR vs Vanilla:"
+    echo "  Throughput difference: ${throughput_diff}%"
+    echo "  Download time overhead: ${overhead}%"
+} >> "$RESULTS_FILE"
 echo ""
 
 echo "=============================================="
@@ -448,3 +484,13 @@ echo -e "${GREEN}Performance testing complete!${NC}"
 echo "=============================================="
 echo ""
 echo "Results saved to: $RESULTS_FILE"
+
+if [ "$vanilla_integrity" = "FAIL" ] || [ "$pqdr_integrity" = "FAIL" ]; then
+    echo -e "${RED}Data integrity check FAILED (see above)${NC}"
+    exit 1
+fi
+
+if [ "$INCOMPLETE_TRANSFERS" -gt 0 ]; then
+    echo -e "${RED}$INCOMPLETE_TRANSFERS timed transfer(s) were incomplete (see above)${NC}"
+    exit 1
+fi
