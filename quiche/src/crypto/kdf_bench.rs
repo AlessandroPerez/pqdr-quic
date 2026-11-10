@@ -25,7 +25,8 @@
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 //! Micro-benchmarks for the per-packet PQDR crypto: the chain step (BLAKE3
-//! against SHA-2 based alternatives) and the AEAD setup.
+//! against SHA-2 based alternatives) and the AEAD setup, and for the ML-KEM-768
+//! operations of each epoch.
 //!
 //! BoringSSL uses the CPU's SHA extensions when it has them, so running this
 //! on such a machine shows whether SHA-2 would be faster there:
@@ -72,6 +73,9 @@ const N: u64 = 300_000;
 
 const PKT_LEN: usize = 1350;
 
+/// Iterations for the ML-KEM operations, which take about 1000 times longer.
+const MLKEM_N: u64 = 3_000;
+
 fn sha_extensions() -> bool {
     #[cfg(target_arch = "x86_64")]
     return std::arch::is_x86_feature_detected!("sha");
@@ -93,25 +97,29 @@ fn ticks() -> Option<u64> {
     None
 }
 
-fn time(name: &str, mut f: impl FnMut()) {
+fn time(name: &str, f: impl FnMut()) {
+    time_n(name, N, f);
+}
+
+fn time_n(name: &str, n: u64, mut f: impl FnMut()) {
     // Warm up.
-    for _ in 0..N / 10 {
+    for _ in 0..n / 10 {
         f();
     }
 
     let start = Instant::now();
     let start_ticks = ticks();
 
-    for _ in 0..N {
+    for _ in 0..n {
         f();
     }
 
-    let ns = start.elapsed().as_nanos() as f64 / N as f64;
+    let ns = start.elapsed().as_nanos() as f64 / n as f64;
 
     match (start_ticks, ticks()) {
         (Some(a), Some(b)) => println!(
             "BENCH {name:52} {ns:7.1} ns {:6.0} TSC ticks",
-            (b - a) as f64 / N as f64
+            (b - a) as f64 / n as f64
         ),
 
         _ => println!("BENCH {name:52} {ns:7.1} ns"),
@@ -350,5 +358,29 @@ fn kdf_bench() {
         }
 
         black_box(&buf);
+    });
+
+    println!("ML-KEM-768, once per epoch:");
+
+    let (private_key, public_key) = MLKEM768_private_key::generate();
+    let (_, ciphertext) =
+        MLKEM768_private_key::encapsulate_to_bytes(&public_key).unwrap();
+
+    time_n("key generation (server)", MLKEM_N, || {
+        black_box(MLKEM768_private_key::generate());
+    });
+
+    time_n(
+        "encapsulation, public key parsing included (client)",
+        MLKEM_N,
+        || {
+            black_box(
+                MLKEM768_private_key::encapsulate_to_bytes(&public_key).unwrap(),
+            );
+        },
+    );
+
+    time_n("decapsulation (server)", MLKEM_N, || {
+        black_box(private_key.decapsulate(&ciphertext).unwrap());
     });
 }

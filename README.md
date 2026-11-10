@@ -2,7 +2,7 @@
 
 **A research fork of Cloudflare's quiche with post-quantum cryptography and Signal-style double ratchet**
 
-[![Performance](https://img.shields.io/badge/overhead-2--4%25-green)](PQDR-QUIC.md#test-results)
+[![Performance](https://img.shields.io/badge/overhead-3.8%25-green)](PQDR-QUIC.md#test-results)
 [![Security](https://img.shields.io/badge/PQ-ML--KEM--768-blue)](PQDR-QUIC.md)
 [![Ratchet](https://img.shields.io/badge/ratchet-60s-orange)](PQDR-QUIC.md)
 
@@ -14,7 +14,7 @@ PQDR-QUIC extends QUIC with:
 - **Post-Quantum Security**: ML-KEM-768 (NIST Level 3) every 60 seconds
 - **Forward Secrecy**: A new key for every packet, from a one-way BLAKE3 key chain (one compression per packet)
 - **Post-Compromise Recovery**: System healing within two ratchet epochs (≤120 seconds) of compromise
-- **Low Overhead**: 2–4% lower throughput in bulk transfers, depending on the machine (see [Performance Results](#performance-results))
+- **Low Overhead**: 3.8% lower throughput in 20GB bulk transfers (see [Performance Results](#performance-results))
 
 📖 **[Complete PQDR Documentation](PQDR-QUIC.md)** - Architecture, security properties, benchmarks, and testing guide
 
@@ -48,24 +48,19 @@ The test streams its data instead of storing it, so a 20GB run needs neither 20G
 | Post-Quantum | ❌ TLS 1.3 only | ✅ ML-KEM-768 |
 | Per-Packet Keys | ❌ TLS session key | ✅ BLAKE3 ratchet |
 | Compromise Recovery | ❌ None | ✅ 60s ML-KEM ratchet |
-| Throughput | baseline | 2–4% lower (see below) |
+| Throughput | baseline | 3.8% lower (see below) |
 
 ### Performance Results
 
-20GB file transfers over loopback with `performance_test.sh`, ChaCha20-Poly1305 in both configurations:
+**20GB file transfer over loopback** (`performance_test.sh`, 5 alternating runs each, ChaCha20-Poly1305 in both configurations, on a 4-core QEMU VM with SSE4.1 but no AVX):
+- Vanilla QUIC: 1573.68 Mbps mean / 1576.80 Mbps median (CV: 1.7%, download 104.14s avg)
+- PQDR-QUIC: 1514.09 Mbps mean / 1512.12 Mbps median (CV: 1.0%, download 108.21s avg)
+- **Overhead: 3.8%** ≈ 4.1 seconds for 20GB
 
-| | Current version, 4-core VM, 5 runs each | Earlier version, author's machine, 10 runs each |
-|---|---|---|
-| Vanilla QUIC | 1573.68 Mbps mean / 1576.80 median (CV 1.7%, download 104.14s avg) | 2351.75 Mbps mean / 2344.68 median (CV 1.0%, download 69.68s avg) |
-| PQDR-QUIC | 1514.09 Mbps mean / 1512.12 median (CV 1.0%, download 108.21s avg) | 2304.77 Mbps mean / 2329.25 median (CV 2.0%, download 71.11s avg) |
-| **Overhead** | **3.8%** ≈ 4.1 seconds for 20GB | **~2.0%** ≈ 1.4 seconds for 20GB |
+Single runs vary by a few percent (the five vanilla/PQDR pairs differed by 1.7% to 6.8%), and absolute numbers depend on the machine.
 
-- The VM is a QEMU guest with SSE4.1 but no AVX; its runs alternate between the two configurations. The earlier version set up a new AEAD context for every packet.
-- PQDR-QUIC costs a roughly fixed amount of CPU per packet, so it is a larger fraction of the total on slower cores.
-- Single runs vary by a few percent: on the VM, the five vanilla/PQDR pairs differed by 1.7% to 6.8%.
-
-**Per-packet cost:** one BLAKE3 compression to step the key chain (88ns on the VM, ~64ns on the author's machine), plus writing the packet key into the connection's ChaCha20-Poly1305 context and wiping it after use (~3ns). In full transfers on the VM, caches are colder and PQDR-QUIC adds about 230ns of client CPU per packet (3.8%). Earlier versions set up a new AEAD context for every packet instead (~186ns on the author's machine, ~250ns per packet in all).
-**Per-ratchet cost:** ~50μs ML-KEM-768 encapsulation
+**Per-packet cost:** one BLAKE3 compression to step the key chain (88ns), plus writing the packet key into the connection's ChaCha20-Poly1305 context and wiping it after use (~3ns). In full transfers, caches are colder: PQDR-QUIC adds about 230ns of client CPU per packet (3.8%).
+**Per-ratchet cost:** once per epoch, ML-KEM-768 key generation (~95μs) and decapsulation (~81μs) on the server, encapsulation (~101μs) on the client
 
 ### Security Properties
 

@@ -10,20 +10,20 @@ PQDR-QUIC extends QUIC with post-quantum cryptography and advanced security prop
 - **Forward secrecy**: Each packet encrypted with a unique key derived via BLAKE3 KDF chain
 - **Post-compromise recovery**: Automatic ML-KEM ratchets every 60 seconds restore security within two epochs of a compromise
 - **Signal-style double ratchet**: Combines symmetric (BLAKE3 chain) and asymmetric (ML-KEM) ratchets
-- **Low overhead**: 2–4% lower throughput in 20GB transfers, depending on the machine (see [Test Results](#test-results))
+- **Low overhead**: 3.8% lower throughput in 20GB transfers (see [Test Results](#test-results))
 
 ### Key Security Properties
 
 **Forward Secrecy (via BLAKE3 Symmetric Ratchet)**
 - Protects the *past*: Even if an attacker compromises key K_n, they cannot decrypt packets 1 through n-1
 - Achieved through one-way BLAKE3 key derivation: each packet key is derived from a chain key that is immediately replaced
-- Operates on every packet: one BLAKE3 compression per packet (88ns on a 4-core VM, ~64ns on the author's machine)
+- Operates on every packet: one BLAKE3 compression per packet (88ns on a 4-core VM)
 
 **Post-Compromise Recovery (via ML-KEM Asymmetric Ratchet)**
 - Protects the *future*: Even if an attacker fully compromises the system at time T, they can only decrypt messages until the end of the following epoch: at most two epoch lengths (120 seconds by default), see [Post-Compromise Recovery](#3-post-compromise-recovery)
 - Achieved through periodic ML-KEM-768 key exchanges that introduce fresh entropy
 - Also called "future secrecy" or "break-in recovery"
-- Operates every 60 seconds with ~50μs overhead per ratchet
+- Operates every 60 seconds: ML-KEM-768 key generation and decapsulation on the server (~95μs and ~81μs), encapsulation on the client (~101μs)
 
 Together, these properties provide **continuous security**: compromise of any single key or state does not permanently break confidentiality.
 
@@ -246,7 +246,7 @@ cargo build --release --package=quiche_apps
 
 PQDR-QUIC always protects payloads with ChaCha20-Poly1305, because it has **zero key schedule cost**, which makes per-packet rekeying cheap. For a fair comparison, plain QUIC should use the same cipher.
 
-Upstream BoringSSL prefers AES-GCM in TLS 1.3 on CPUs with AES instructions, and offers no regular API to change that order. `Config::enable_chacha20_preference(true)` makes it prefer ChaCha20-Poly1305 anyway, through BoringSSL's AES-hardware override (`SSL_CTX_set_aes_hw_override_for_testing`, which is C++-only and reached through the small wrapper in `quiche/src/tls/boringssl_shim.cc`). The apps enable it by default, so vanilla and PQDR runs both use ChaCha20-Poly1305 from a fresh clone, without modifying BoringSSL. (The published numbers were measured with an equivalent local change to BoringSSL's cipher order.)
+Upstream BoringSSL prefers AES-GCM in TLS 1.3 on CPUs with AES instructions, and offers no regular API to change that order. `Config::enable_chacha20_preference(true)` makes it prefer ChaCha20-Poly1305 anyway, through BoringSSL's AES-hardware override (`SSL_CTX_set_aes_hw_override_for_testing`, which is C++-only and reached through the small wrapper in `quiche/src/tls/boringssl_shim.cc`). The apps enable it by default, so vanilla and PQDR runs both use ChaCha20-Poly1305 from a fresh clone, without modifying BoringSSL.
 
 ⚠️ **Note**: `tokio-quiche` uses the `boring` crate which doesn't have ML-KEM support. Use `quiche` directly or `quiche_apps` for PQDR-QUIC.
 
@@ -305,11 +305,11 @@ No test data is stored, on disk or in memory, so a 20GB test needs neither 20GB 
 - Aggregate statistics (mean, median, standard deviation, min, max, CV%)
 - Performance comparison (overhead percentage)
 
-Throughput is reported in Mbps computed as `GiB × 1024 × 8 / seconds`, as in the published results.
+Throughput is reported in Mbps computed as `GiB × 1024 × 8 / seconds`.
 
 #### Test Results
 
-**Current version**, on a 4-core QEMU VM (x86-64 with SSE4.1, no AVX), **5 alternating runs each** (20GB file transfer, loopback):
+On a 4-core QEMU VM (x86-64 with SSE4.1, no AVX), **5 alternating runs each** (20GB file transfer, loopback):
 
 **Vanilla QUIC**:
 - Mean throughput: **1573.68 Mbps** | Median: 1576.80 Mbps
@@ -325,23 +325,7 @@ Throughput is reported in Mbps computed as `GiB × 1024 × 8 / seconds`, as in t
 
 Both integrity checks passed (20GB of random data each, md5sum).
 
-**Earlier version**, which set up a new AEAD context for every packet, on the author's machine, **10 runs each** (20GB file transfer, loopback):
-
-**Vanilla QUIC**:
-- Mean throughput: **2351.75 Mbps** | Median: 2344.68 Mbps
-- StdDev: 34.48 Mbps | CV: 1.0%
-- Download time: 69.68s average (min: 67.89s, max: 71.39s)
-
-**PQDR-QUIC (60s ratchet)**:
-- Mean throughput: **2304.77 Mbps** | Median: 2329.25 Mbps
-- StdDev: 46.23 Mbps | CV: 2.0%
-- Download time: 71.11s average (min: 69.53s, max: 73.34s)
-
-**Overhead: ~2.0%** (≈ 1.4 seconds for 20GB)
-
-All 20 runs passed integrity check (BLAKE3 hash match).
-
-Absolute numbers, and the relative overhead, depend on the machine: the per-packet cost of PQDR-QUIC is roughly constant, so it is a larger fraction of the total on machines with slower cores. The VM reaches about two thirds of the throughput of the author's machine.
+Absolute numbers, and the relative overhead, depend on the machine.
 
 ## Epoch Switches and Robustness
 
@@ -376,28 +360,22 @@ This is best effort: Rust moves values with plain memory copies, so short-lived 
 
 ### Measured Overhead
 
-**Per-operation costs**, current version, on a 4-core QEMU VM (SSE4.1, no AVX), measured with `kdf_bench` (each operation repeated in a tight loop):
+**Per-operation costs** on a 4-core QEMU VM (SSE4.1, no AVX), measured with `kdf_bench` (each operation repeated in a tight loop):
 - **BLAKE3 chain step**: 88ns per packet
 - **Packet key written into the AEAD context and wiped after use**: ~3ns per packet (setting up and cleaning up a context for every packet instead: ~10ns)
 - **ChaCha20-Poly1305 seal of a 1350-byte packet**: ~1.5μs, the same work as in vanilla QUIC
+- **ML-KEM-768, once per epoch**: key generation ~95μs and decapsulation ~81μs on the server, encapsulation ~101μs on the client
 
 In a real transfer the caches are colder than in that loop. CPU profiles (`perf`) of the client during a transfer showed about 120ns per packet in the BLAKE3 chain step, and about 58ns per packet for setting up a context per packet, as earlier versions did.
 
-**Per-operation costs**, earlier version, on the author's machine:
-- **BLAKE3 key derivation**: ~64ns per packet
-- **EVP_AEAD_CTX init/cleanup**: ~186ns per packet (ChaCha20-Poly1305); the context is now set up once per connection, and each packet only writes and wipes its 32-byte key
-- **ML-KEM-768 encapsulation**: ~50μs per ratchet (every 60 seconds)
-- **Total per-packet overhead**: ~250ns with the per-packet context setup
-
-To measure the per-packet crypto on your own machine, including SHA-2 based alternatives to the BLAKE3 chain step (BoringSSL uses the CPU's SHA extensions when available):
+To measure these on your own machine, including SHA-2 based alternatives to the BLAKE3 chain step (BoringSSL uses the CPU's SHA extensions when available):
 
 ```bash
 cargo test --release -p quiche --lib -- --ignored --nocapture kdf_bench
 ```
 
 **End-to-end performance** (see [Test Results](#test-results)):
-- Current version, 4-core VM: 1574 Mbps vanilla, 1514 Mbps PQDR-QUIC, **3.8% overhead**
-- Earlier version, author's machine: ~2352 Mbps vanilla, ~2305 Mbps PQDR-QUIC, **~2% overhead**
+- 4-core VM: 1574 Mbps vanilla, 1514 Mbps PQDR-QUIC, **3.8% overhead**
 - CPU time on the VM (5 alternating 4GB transfers): PQDR-QUIC adds about 230ns per packet on the client (receiver), 3.8% of its ~6.0μs per packet, and about 160ns (3.7%) on the server (sender). The client is the bottleneck.
 
 **Memory usage** per connection:
@@ -456,7 +434,7 @@ PQDR-QUIC provides multiple layers of security:
 - **Property**: Compromise of key K_n at time T cannot decrypt packets before n
 - **Mechanism**: Each packet key is derived from a chain key via one-way KDF, then the chain key is replaced
 - **Coverage**: Protects *all past communications*
-- **Cost**: one BLAKE3 compression per packet (88ns on a 4-core VM, ~64ns on the author's machine)
+- **Cost**: one BLAKE3 compression per packet (88ns on a 4-core VM)
 
 **Example**: If an attacker compromises the system and extracts the chain key at packet 1,000,000:
 - ✓ Can decrypt packet 1,000,000
@@ -469,7 +447,7 @@ PQDR-QUIC provides multiple layers of security:
 - **Mechanism**: New ML-KEM key exchange introduces fresh entropy not controlled by attacker
 - **Coverage**: Protects *future communications after compromise*
 - **Also called**: "Future secrecy" or "break-in recovery"
-- **Cost**: ~50μs per ratchet
+- **Cost**: per ratchet, ~175μs on the server (key generation and decapsulation) and ~100μs on the client (encapsulation), on a 4-core VM
 
 Recovery takes two epochs because the key exchange for epoch N+1 happens during epoch N: the server generates its key pair at the start of epoch N, and the client encapsulates to it at t=55s. An attacker who compromises the server during epoch N obtains that private key (or the resulting shared secret) along with the epoch N keys. The key pair for epoch N+2 is only generated at the start of epoch N+1, after the compromise.
 
@@ -503,7 +481,7 @@ This matches the security model of secure messaging apps like Signal, applied to
 - [x] ML-KEM-768 integration
 - [x] BLAKE3 KDF integration
 - [x] Packet encryption/decryption with per-packet rekeying
-- [x] Performance optimization (~2% overhead on the author's machine)
+- [x] Performance optimization
 - [x] Comprehensive performance testing framework (10-run statistical analysis)
 - [x] ChaCha20-Poly1305 cipher standardization (fair comparison)
 - [x] Bug 4 fix: epoch-transition `recv_chain_pn` sync for in-flight packets
@@ -545,9 +523,9 @@ This matches the security model of secure messaging apps like Signal, applied to
 | **AEAD Tag** | 16 bytes (128 bits) | Authentication tag |
 | **UDP Datagram** | 1200 bytes | Minimum MTU size |
 | **Effective Payload** | ~1161 bytes | 96.7% efficiency |
-| **Overhead** | 2–4% | End-to-end bulk transfer: 3.8% on a 4-core VM (current version), ~2% on the author's machine (earlier version) |
-| **Per-packet Cost** | ~90ns key work, ~230ns CPU in a transfer | 4-core VM: BLAKE3 chain step (88ns) and AEAD key write and wipe (~3ns) in a tight loop; about 230ns more client CPU per packet than vanilla in real transfers. Author's machine, earlier version: ~250ns with the AEAD context set up per packet |
-| **Per-ratchet Cost** | ~50μs | ML-KEM encapsulation |
+| **Overhead** | 3.8% | End-to-end 20GB bulk transfer on a 4-core VM (5 alternating runs) |
+| **Per-packet Cost** | ~90ns key work, ~230ns CPU in a transfer | 4-core VM: BLAKE3 chain step (88ns) and AEAD key write and wipe (~3ns) in a tight loop; about 230ns more client CPU per packet than vanilla in real transfers |
+| **Per-ratchet Cost** | ~175μs server, ~100μs client | ML-KEM-768 key generation and decapsulation (server), encapsulation (client) |
 | **Memory/Connection** | ~6KB client, ~14KB server | Ratchet state, public key chunks and (server) the next epoch's ML-KEM private key |
 | **Skipped Keys Cache** | 512 keys max | ~45KB when full, for out-of-order packets |
 
