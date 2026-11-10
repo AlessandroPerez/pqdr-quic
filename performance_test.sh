@@ -232,6 +232,11 @@ verify_integrity() {
     fi
 }
 
+# bc prints numbers between -1 and 1 without the leading zero (".97"); add it.
+leading_zero() {
+    sed -e 's/^\./0./' -e 's/^-\./-0./'
+}
+
 # Function to calculate statistics
 calculate_stats() {
     local values=("$@")
@@ -272,14 +277,16 @@ calculate_stats() {
         variance=$(echo "$variance + $sq" | bc)
     done
     variance=$(echo "scale=10; $variance / $count" | bc)
-    local stddev=$(echo "scale=2; sqrt($variance)" | bc)
+    # sqrt() keeps the 10 decimals of $variance; dividing by 1 at scale=2
+    # truncates to 2.
+    local stddev=$(echo "scale=10; s = sqrt($variance); scale=2; s / 1" | bc | leading_zero)
 
     # Min and max
     local min=${sorted[0]}
     local max=${sorted[$((count - 1))]}
 
     # Coefficient of variation (CV%)
-    local cv=$(echo "scale=2; $stddev * 100 / $mean" | bc)
+    local cv=$(echo "scale=2; $stddev * 100 / $mean" | bc | leading_zero)
 
     echo "$mean $median $stddev $min $max $cv"
 }
@@ -362,35 +369,39 @@ declare -a vanilla_throughputs
 declare -a pqdr_download_times
 declare -a pqdr_throughputs
 
-# run_config <name> <pqdr: true|false> <array prefix>
-run_config() {
+# run_and_record <name> <pqdr: true|false> <array prefix> <run number>
+run_and_record() {
     local name=$1
     local pqdr_enabled=$2
     local prefix=$3
+    local i=$4
 
-    echo ""
-    echo "=============================================="
-    echo -e "${YELLOW}Running $name Tests${NC}"
-    echo "=============================================="
-    echo ""
+    run_test "$name" "$pqdr_enabled" "$i"
 
-    for i in $(seq 1 "$RUNS"); do
-        run_test "$name" "$pqdr_enabled" "$i"
+    eval "${prefix}_download_times+=(\"$DOWNLOAD_TIME\")"
+    eval "${prefix}_throughputs+=(\"$THROUGHPUT\")"
 
-        eval "${prefix}_download_times+=(\"$DOWNLOAD_TIME\")"
-        eval "${prefix}_throughputs+=(\"$THROUGHPUT\")"
-
-        # Save individual result
-        echo "=== $name - Run $i ===" >> "$RESULTS_FILE"
-        echo "Download time:      ${DOWNLOAD_TIME}s" >> "$RESULTS_FILE"
-        echo "Throughput:         ${THROUGHPUT} Mbps" >> "$RESULTS_FILE"
-        echo "Bytes received:     ${BYTES_RECEIVED}" >> "$RESULTS_FILE"
-        echo "" >> "$RESULTS_FILE"
-    done
+    # Save individual result
+    echo "=== $name - Run $i ===" >> "$RESULTS_FILE"
+    echo "Download time:      ${DOWNLOAD_TIME}s" >> "$RESULTS_FILE"
+    echo "Throughput:         ${THROUGHPUT} Mbps" >> "$RESULTS_FILE"
+    echo "Bytes received:     ${BYTES_RECEIVED}" >> "$RESULTS_FILE"
+    echo "" >> "$RESULTS_FILE"
 }
 
-run_config "Vanilla QUIC" "false" vanilla
-run_config "PQDR-QUIC" "true" pqdr
+# The two configurations take turns, so that slow changes in machine speed
+# during the test (thermal throttling, background load, a busy VM host)
+# affect both alike instead of favoring whichever ran first.
+echo ""
+echo "=============================================="
+echo -e "${YELLOW}Running Vanilla QUIC and PQDR-QUIC Tests, alternating${NC}"
+echo "=============================================="
+echo ""
+
+for i in $(seq 1 "$RUNS"); do
+    run_and_record "Vanilla QUIC" "false" vanilla "$i"
+    run_and_record "PQDR-QUIC" "true" pqdr "$i"
+done
 
 # print_stats <name> <throughputs...> -- <download times...>
 print_stats() {
@@ -461,8 +472,8 @@ pqdr_dl_mean=$LAST_DL_MEAN
 echo -e "${BLUE}Performance Comparison:${NC}"
 # Multiply before dividing: bc truncates every intermediate result to `scale`
 # decimal places.
-overhead=$(echo "scale=2; ($pqdr_dl_mean - $dl_mean) * 100 / $dl_mean" | bc)
-throughput_diff=$(echo "scale=2; ($mean - $pqdr_mean) * 100 / $mean" | bc)
+overhead=$(echo "scale=2; ($pqdr_dl_mean - $dl_mean) * 100 / $dl_mean" | bc | leading_zero)
+throughput_diff=$(echo "scale=2; ($mean - $pqdr_mean) * 100 / $mean" | bc | leading_zero)
 
 echo "  PQDR vs Vanilla:"
 echo "    Throughput difference: ${throughput_diff}%"

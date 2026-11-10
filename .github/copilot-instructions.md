@@ -2,14 +2,15 @@
 
 This is a Rust implementation of QUIC transport protocol and HTTP/3 used by Cloudflare and integrated into Android, curl, and other projects.
 
+This repository is PQDR-QUIC, a research fork of quiche that adds ML-KEM-768 key exchanges and a double ratchet (per-packet BLAKE3 keys, ChaCha20-Poly1305). See [PQDR-QUIC.md](../PQDR-QUIC.md) and the [PQDR-QUIC section](#pqdr-quic) below.
+
 ## Architecture Overview
 
 ### Workspace Structure
-This is a Cargo workspace with 12 member crates organized by responsibility:
+This is a Cargo workspace organized by responsibility:
 - **quiche/** - Core QUIC and HTTP/3 protocol implementation (low-level API)
-- **tokio-quiche/** - Async wrapper bridging quiche with tokio's event loop  
 - **apps/** - CLI tools (`quiche-client`, `quiche-server`) for testing (not production-ready)
-- **h3i/** - Interactive HTTP/3 debugging/testing tool to bend RFC rules
+- **tokio-quiche/**, **h3i/** - Async tokio wrapper and HTTP/3 testing tool; still in the tree but removed from the workspace, because they use the `boring` crate, which lacks ML-KEM
 - **buffer-pool/**, **datagram-socket/** - Performance-oriented I/O utilities
 - **qlog/**, **qlog-dancer/** - QUIC event logging per IETF draft specs
 - **netlog/**, **octets/** - Supporting protocol utilities
@@ -34,9 +35,9 @@ cargo build --package=quiche_apps
 cargo run --bin quiche-client -- https://cloudflare-quic.com/
 cargo run --bin quiche-server -- --cert apps/src/bin/cert.crt --key apps/src/bin/cert.key
 
-# Run tests with specific TLS backend
-cargo test --verbose --all-targets --features=boringssl-boring-crate
-cargo test --verbose --doc --features=boringssl-boring-crate
+# Run tests (PQDR-QUIC needs the default vendored BoringSSL, so not
+# --features=boringssl-boring-crate)
+cargo test --verbose --all-targets -p quiche
 
 # Build with alternative congestion control (gcongestion feature)
 cargo build --features=gcongestion
@@ -108,6 +109,15 @@ Enable `ffi` feature to expose C API in `include/quiche.h`. Produces `libquiche.
 2. **Not handling `Error::Done`**: This is normal return value, not an error
 3. **Ignoring pacing hints**: Use `SendInfo.at` field for packet pacing to avoid bursts
 4. **Using apps/ binaries in production**: They're examples only - see disclaimers in README
+
+## PQDR-QUIC
+
+- **Code**: `quiche/src/crypto/ratchet.rs` (double-ratchet state machine), `crypto/blake3_kdf.rs` (key derivation), `crypto/mod.rs` (`PqdrAead`, per-packet ChaCha20-Poly1305), `crypto/boringssl.rs` (ML-KEM and AEAD bindings), `crypto/reed_solomon.rs` (public key chunk coding), plus the integration in `packet.rs`, `lib.rs`, `transport_params.rs` and `tls/`
+- **Upstream fork point**: commit `517c0d6e`; `git diff 517c0d6e HEAD` shows everything this fork changed
+- **TLS backend**: PQDR needs the vendored BoringSSL (the default `boringssl-vendored` feature); the `boringssl-boring-crate` feature lacks ML-KEM
+- **Tests**: `cargo test -p quiche --lib -- crypto:: pqdr_tests`; end-to-end tests are in `quiche/src/pqdr_tests.rs` and shorten epochs with `Config::set_pqdr_ratchet_interval`
+- **Benchmarks**: `./performance_test.sh --runs 5` (end to end, vanilla vs PQDR) and `cargo test --release -p quiche --lib -- --ignored --nocapture kdf_bench` (per-packet crypto)
+- **Wire format and key schedule**: changes to either break interoperability with earlier builds; see PQDR-QUIC.md
 
 ## Key Files
 - [quiche/src/lib.rs](../quiche/src/lib.rs) - Main QUIC connection API
